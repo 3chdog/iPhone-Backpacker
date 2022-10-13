@@ -1,21 +1,38 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 from win32com.shell import shell, shellcon
-import pythoncom, os
+import pythoncom
+
+import os, argparse
+from tqdm import tqdm
 from typing import List
+
 FILTER=["jpg", "JPG", "Jpg",
         "jpeg", "JPEG", "Jpeg",
         "png", "PNG", "Png",
         "bmp", "BMP", "Bmp"]
 
 
-def getItemsInside(parentFolderObject, filtered=False):
+def getItemsInside(parentFolderObject, filtering=False):
     nameList = []
     for pidl in parentFolderObject:
         fileName = parentFolderObject.GetDisplayNameOf(pidl, shellcon.SHGDN_NORMAL)
-        if not filtered: nameList.append(fileName)
+        if not filtering: nameList.append(fileName)
         else:
             extName = fileName.split(".")[-1]
             if extName in FILTER: nameList.append(fileName)
     return nameList
+
+def getFilteringSignals(parentFolderObject):
+    filteringSignals = []
+    for pidl in parentFolderObject:
+        fileName = parentFolderObject.GetDisplayNameOf(pidl, shellcon.SHGDN_NORMAL)
+        extName = fileName.split(".")[-1]
+        filteringSignals.append(True if extName in FILTER else False)
+    return filteringSignals
+
+
 
 def ChineseCharacterChecking(folderName):
     if folderName == "Users": return "使用者"
@@ -72,11 +89,14 @@ def checkFolderName(folderName:str):
 
 
 def parseAbsName(winAbsPath:str, rootName="本機"):
-    pathSplit = winAbsPath.split(":")
-    dirFolders = list(iter_split(pathSplit[-1]))
-    #dirFolders[0] = checkFolderName(dirFolders[0])
-    dirFolders.insert(0, pathSplit[0])
-    dirFolders.insert(0, rootName)
+    if ":" in winAbsPath:
+        pathSplit = winAbsPath.split(":")
+        dirFolders = list(iter_split(pathSplit[-1]))
+        #dirFolders[0] = checkFolderName(dirFolders[0])
+        dirFolders.insert(0, pathSplit[0])
+    else:
+        dirFolders = list(iter_split(winAbsPath))
+    if "本機" not in dirFolders: dirFolders.insert(0, rootName)
     print("Parsing Complete: {}".format(dirFolders))
     return dirFolders
 
@@ -85,13 +105,13 @@ def getFolderObject_byAbsPath(absPath):
     dirFolders = parseAbsName(absPath)
 
     folderObject, _ = getFolderObject(dirFolders[0])
-    folderObject, _ = getFolderObject(dirFolders[1]+":", folderObject,  isWholeName=False)
+    folderObject, _ = getFolderObject(dirFolders[1]+":" if ":" in absPath else dirFolders[1], folderObject,  isWholeName=False)
 
     for folder in dirFolders[2:]:
         parentFolderObject = folderObject
         folderObject, folderPIDL = getFolderObject(folder, parentFolderObject)
 
-    print("Sucess to get folder object.\nObject with path: [{}]\n".format(absPath))
+    print("Success to get folder object.  ||  Object with path: [{}]\n".format(absPath))
     return folderObject, folderPIDL
     
 
@@ -111,45 +131,53 @@ def copyShellItem(srcFolderObject, dstFolderObject, itemPIDL, dstItemName=None):
     print("Copy Log: {}".format(success))
 
 
-def copyShellItem_batch(srcFolderObject, dstFolderObject, itemPIDL,itemPIDL2, dstItemName=None):
+def copyShellItem_batch(srcFolderObject, dstFolderObject, itemPIDL_list:List, dstItemName=None, filtering=True):
+    if filtering: filteringSignals = getFilteringSignals(srcFolderObject)
     src_idl = shell.SHGetIDListFromObject(srcFolderObject) #Grab the PIDL from the folder object
     dst_idl = shell.SHGetIDListFromObject(dstFolderObject) #Grab the PIDL from the folder object
 
-    src = shell.SHCreateShellItem(src_idl, None, itemPIDL) #Create a ShellItem of the source file
-    src2 = shell.SHCreateShellItem(src_idl, None, itemPIDL2) #Create a ShellItem of the source file
+    src_list = []
+    if filtering:
+        for pidl, isFiltered in zip(itemPIDL_list, filteringSignals):
+            if isFiltered: src_list.append(shell.SHCreateShellItem(src_idl, None, pidl)) #Create a ShellItem of the source file
+    else:
+        for pidl in itemPIDL_list:
+            src_list.append(shell.SHCreateShellItem(src_idl, None, pidl)) #Create a ShellItem of the source file
+
     dst = shell.SHCreateItemFromIDList(dst_idl)
 
     # Python IFileOperation
     pfo = pythoncom.CoCreateInstance(shell.CLSID_FileOperation,None,pythoncom.CLSCTX_ALL,shell.IID_IFileOperation)
     pfo.SetOperationFlags(shellcon.FOF_NOCONFIRMATION)
-    pfo.CopyItem(src, dst, dstItemName) # Schedule an operation to be performed
-    pfo.CopyItem(src2, dst, dstItemName) # Schedule an operation to be performed
+    print("Loading files to copy...")
+    for src in tqdm(src_list):
+        pfo.CopyItem(src, dst, dstItemName) # Schedule an operation to be performed
+    print("There are {} files to be copied. [{}].".format(len(src_list), "Filtered" if filtering else "Not filtered, Copy All."))
+    print("Starting Copying...")
     success = pfo.PerformOperations() #perform operation
     print("Copy Log: {}".format(success))
 
+def getArguments():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-f', '--fromPath', type=str, required=True ,help='Input the folder path of where your photos are. (to be copied)')
+    parser.add_argument('-t', '--toPath', type=str, required=True ,help='Input the folder path of where your photos are going to copy to. (your backup storage, not iPhone)')
+    parser.add_argument('--filter', type=int, required=False, default=True, help='Input 1 if you only want to copy images, otherwise input 0 to copy all. (Default: 1)')
+    args = parser.parse_args()
+    return args
+
+def main():
+    args = getArguments()
+    fromPath = args.fromPath
+    toPath = args.toPath
+    filtering = args.filter
+    print(filtering)
+    sourceFolderObject, _ = getFolderObject_byAbsPath(fromPath)
+    destinFolderObject, _ = getFolderObject_byAbsPath(toPath)
+    copyShellItem_batch(sourceFolderObject, destinFolderObject, sourceFolderObject, filtering=filtering)
+
+# python iphoneGetDrive_module.py -f C:\Users\pair\jackchang\111_1_Course\images -t C:\Users\pair\jackchang\111_1_Course\images_2 --filter 1
 
 
-print("=================")
-desktop = shell.SHGetDesktopFolder()
-#getFolderObject("本機", isWholeName=False)
-#a=  shell.SHCreateItemFromParsingName("D:\\python_file", None, shell.IID_IShellItem)
-#print(a)
-sourceFolderObject, _ = getFolderObject_byAbsPath("D:\\python_file\\image")
-destinFolderObject, _ = getFolderObject_byAbsPath("C:\\Users\\Administrator\\Desktop\\pic\\ga")
-
-#print(getItemsInside(sourceFolderObject))
-#a = getItemsInside(sourceFolderObject, filtered=True)[0]
-'''
-for i in sourceFolderObject:
-    copyShellItem(sourceFolderObject, destinFolderObject, i)
-'''
-for i, ss in enumerate(sourceFolderObject):
-    if i==0: ppp = ss
-    if i==1:
-        ppp2 = ss
-        break
-copyShellItem(sourceFolderObject, destinFolderObject, ppp)
-copyShellItem(sourceFolderObject, destinFolderObject, ppp2)
-
-#copyShellItem(sourceFolderObject, destinFolderObject, ppp)
-
+if __name__=="__main__":
+    main()
+    

@@ -1,0 +1,10 @@
+你想複製的資料夾們: (一個資料夾一行)
+本機\Apple iPhone\Internal Storage\DCIM\100APPLE
+本機\Apple iPhone\Internal Storage\DCIM\101APPLE
+本機\Apple iPhone\Internal Storage\DCIM\102APPLE
+
+你想複製到的母資料夾: (只放一個資料夾，上面的資料夾都會放在這個資料夾之下)
+D:\3chdog\myimages
+
+只複製圖檔嗎? (yes/no)
+yes
