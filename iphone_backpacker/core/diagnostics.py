@@ -525,9 +525,11 @@ def _describe_wpd(report, candidates=()):
     report.say("WPD 看到 {} 台裝置"
                "（這是獨立於 Shell 列舉的第二個答案）：".format(len(result.devices)))
     matched_any = False
-    for entry in result.devices:
+    name_errors = []
+    for index, entry in enumerate(result.devices, 1):
         report.say()
-        report.say("  {}".format(entry.friendly_name or "（沒有名稱）"))
+        report.say("  裝置 {}{}".format(
+            index, "：{}".format(entry.friendly_name) if entry.friendly_name else ""))
         # ★ 裝置 ID 一定要印出來。名稱取不到時它就是唯一的辨識依據，
         #   而且它裡面帶著 vid/pid 與序號，比名稱還可靠。
         report.say("      裝置 ID   = {}".format(entry.device_id or "（取不到）"))
@@ -535,7 +537,10 @@ def _describe_wpd(report, candidates=()):
             report.say("      製造商    = {}".format(entry.manufacturer or "（取不到）"))
             report.say("      描述      = {}".format(entry.description or "（取不到）"))
         if entry.name_error:
-            report.say("      名稱取不到的原因 = {}".format(entry.name_error))
+            # ★ 只收集，不逐台印（2026-09-14）。實測三台的失敗原因一模一樣，
+            #   逐台印等於同一行 Python 錯誤訊息重複三次 —— 看起來像出大事，
+            #   實際上完全不影響判斷。集中放在這一段最後講清楚就好。
+            name_errors.append(entry.name_error)
 
         hits = [name for name, parsing in shell_ids
                 if entry.device_id and entry.device_id.lower() in parsing]
@@ -565,6 +570,12 @@ def _describe_wpd(report, candidates=()):
     elif not shell_ids:
         report.say("（Shell 那邊一個候選裝置都沒有，所以沒得對照。"
                    "若 WPD 這裡看得到你的手機，請務必回報。）")
+
+    if name_errors and not any(d.friendly_name for d in result.devices):
+        report.say()
+        report.say("（這台電腦取不到 WPD 的裝置名稱，**這不是問題** ——")
+        report.say("　上面的「裝置 ID」與「對照 Shell」已經足夠辨識是哪一台。）")
+        report.say("　技術細節（給開發者看的）：{}".format(name_errors[0]))
 
 
 def _describe_log_tail(report):

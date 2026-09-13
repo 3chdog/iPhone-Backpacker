@@ -845,19 +845,40 @@ WPD   : \\?\usb#vid_05ac&pid_12a8#0000802000117ce43684002e#{6ac27878-a6fa-4155-b
 不需要比對任何顯示名稱、也不需要寫死 vid/pid（守住 D5）。
 診斷報告第六段就是這樣交叉比對的。
 
-## `GetDeviceFriendlyName` 取不到名稱
+## `GetDeviceFriendlyName` 取不到名稱 —— **刻意不修**
 
-實測三台的名稱、製造商、描述**全是空的**。目前還不知道確切原因
-（推測是 comtypes 產生的簽章要 `WCHAR*`，而 `create_unicode_buffer()`
-的 `c_wchar` 陣列被型別檢查擋掉）。
+實測三台的名稱、製造商、描述**全是空的**，而錯誤是在**第一段**就發生：
 
-**但這不重要** —— 裝置 ID 裡面就有 vid/pid 與序號，比名稱可靠得多。
-現在報告一定會印出裝置 ID，並且把「名稱取不到的原因」一起印出來，
-下一輪就能確定是哪一種。
+```
+GetDeviceFriendlyName：問長度就失敗：'NoneType' object cannot be interpreted as an integer
+```
+
+這是 Python 層的錯誤，不是 COM 錯誤。IDL 上這個方法是
+
+```
+HRESULT GetDeviceFriendlyName(
+    [in] LPCWSTR pszPnPDeviceID,
+    [in, out, unique, size_is(*pcchDeviceFriendlyName)] WCHAR *pDeviceFriendlyName,
+    [in, out] DWORD *pcchDeviceFriendlyName);
+```
+
+`size_is(*pcchDeviceFriendlyName)` 讓 comtypes 想用第三個參數去決定陣列長度，
+而我們第一段傳的第二個參數是 `None` —— 推測是這裡對不上。
+
+**結論：不修。** 理由：
+
+1. **裝置 ID 比名稱可靠得多** —— 裡面有 vid/pid 與序號，而且
+   名稱是使用者可以改的（改了就會違反 D5 的精神）。
+2. **交叉比對已經解決辨識問題** —— 報告會直接寫「★ 就是上面的
+   「Apple iPhone」」，名稱一點忙都幫不上。
+3. 開發機是 Linux，每一次嘗試都要 Jack 在 Windows 上重跑一輪 build +
+   測試。為了一個沒有價值的欄位燒掉好幾輪，不划算。
+
+報告現在把這個錯誤集中在該段最後講一次，並明說「**這不是問題**」。
 
 **教訓**：`_string_property` 原本把失敗吞進 `log.debug`，
 於是報告只印「（取不到）」卻不說為什麼 —— 等於白跑一輪。
-**取不到的原因本身就是要回報的資訊。**
+**取不到的原因本身就是要回報的資訊**，而且要印在人看得到的地方。
 
 ---
 
