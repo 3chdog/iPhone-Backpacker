@@ -295,7 +295,12 @@ def probe(device):
     """
     report = shell_ns.EnumReport()
     try:
-        storages = list_subfolders(device.abs_pidl, report=report)
+        # ★ 這裡用 verify_empty=True，跟一般的瀏覽路徑不同。
+        #   成本是「只有在結果為 0 時才多列舉一次、而且只有一個節點」，
+        #   可以忽略；但這個 0 決定的是要不要叫使用者「去手機上按信任」。
+        #   叫一個早就按過信任的人再去按一次，比不講話還糟。
+        storages = list_subfolders(device.abs_pidl, report=report,
+                                   verify_empty=True)
     except BackpackerError as exc:
         log.warning("裝置「%s」的儲存區列不出來：%s", device.name, exc)
         return DeviceStatus.READ_FAILED

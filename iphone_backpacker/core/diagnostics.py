@@ -289,8 +289,8 @@ def _describe_one_folder(report, folder):
                    "它的結果不能拿來判斷裝置狀態。）")
     report.say()
 
-    def count(flags, label):
-        """列舉並印出完整的可信度紀錄。
+    def scan(flags, label):
+        """列舉一次並印出完整的可信度紀錄。回傳 (名稱清單 or None, 紀錄)。
 
         ★ 「8.8 秒回傳 0 項」和「20 毫秒回傳 0 項」是完全不同的兩件事 ——
           前者是逾時（裝置連線壞掉），後者才是真的空資料夾。
@@ -299,26 +299,23 @@ def _describe_one_folder(report, folder):
         """
         enum_report = shell_ns.EnumReport()
         try:
-            items = list(shell_ns.iter_entries(folder.abs_pidl, flags=flags,
-                                               verify_empty=True,
-                                               report=enum_report))
+            names = [name for _abs, name, _attrs in shell_ns.iter_entries(
+                folder.abs_pidl, flags=flags, verify_empty=True,
+                report=enum_report)]
         except Exception as exc:   # noqa: BLE001
             report.say("  {:<12} 讀取失敗：{}".format(label, exc))
             report.say("      {}".format(enum_report.describe()))
-            return None
+            return None, enum_report
         report.say("  {:<12} {}".format(label, enum_report.describe()))
-        if not items and enum_report.suspicious_zero:
-            report.say("      !! 這個 0 不可信 —— 見上面的耗時與嘗試次數。")
-        return len(items)
+        return names, enum_report
 
-    counts = {}
-    for flags, label in ((shell_ns.FILES_ONLY, "只列檔案"),
-                         (shell_ns.FOLDERS_ONLY, "只列資料夾"),
-                         (shell_ns.EVERYTHING, "全部")):
-        counts[label] = count(flags, label)
+    files, files_report = scan(shell_ns.FILES_ONLY, "只列檔案")
+    folders, folders_report = scan(shell_ns.FOLDERS_ONLY, "只列資料夾")
+    everything, _all_report = scan(shell_ns.EVERYTHING, "全部")
 
     report.say()
-    if None in counts.values():
+
+    if files is None or folders is None or everything is None:
         if local:
             # ★ 本機資料夾讀不到，多半是那個資料夾根本不存在（例如被
             #   Windows 隱藏起來的 3D Objects），跟 iPhone 一點關係都沒有。
@@ -332,29 +329,56 @@ def _describe_one_folder(report, folder):
         report.say("!! 有列舉失敗 —— 顯示 0 個檔案很可能是讀取問題，不是真的空的。")
         return
 
-    if counts["只列檔案"] + counts["只列資料夾"] != counts["全部"]:
+    # ★★ 「只列檔案 0 項而且很慢」不一定可疑（2026-09-14 實測修正）。
+    #   實測 [Internal Storage]：只列檔案 0 項花了 1542 ms，被標成「不可信」——
+    #   但那是**假警報**。它底下有 181 個子資料夾，而 SHCONTF_NONFOLDERS
+    #   是**事後過濾**（見 D10）：provider 會先把 181 項全部實體化再濾掉，
+    #   所以慢是必然的，跟連線狀態無關。
+    #   有子資料夾就是對這個慢最好的解釋，不要再嚇使用者。
+    if not files and folders and files_report.suspicious_zero:
+        report.say("「只列檔案」是 0 項而且花了一段時間，但**這是正常的**：")
+        report.say("　這個資料夾底下有 {} 個子資料夾，而 Windows 的"
+                   "「只列檔案」是事後過濾 ——".format(len(folders)))
+        report.say("　它會先把 {} 項全部讀出來再濾掉，所以慢是必然的，"
+                   "不代表讀取有問題。".format(len(folders)))
+        report.say()
+    elif not files and files_report.suspicious_zero:
+        report.say("!! 「只列檔案」的 0 不可信 —— 見上面的耗時與嘗試次數。")
+        report.say()
+
+    if len(files) + len(folders) != len(everything):
         report.say("!! 數字對不起來：{} + {} != {}".format(
-            counts["只列檔案"], counts["只列資料夾"], counts["全部"]))
+            len(files), len(folders), len(everything)))
         report.say("!! 這代表列舉不穩定，顯示的數量不可信。")
 
-    if counts["全部"] == 0:
+    if not everything:
         report.say("!! 這個資料夾三種列舉都是 0 項，看起來是真的空的。")
         report.say("!! 如果用檔案總管進去看得到照片，請務必回報。")
         return
 
-    names = [n for _, n, _ in shell_ns.iter_entries(
-        folder.abs_pidl, flags=shell_ns.EVERYTHING)]
+    # ★ 資料夾與檔案要標示清楚（2026-09-14 修）。
+    #   舊版把子資料夾也丟進 categorize()，於是 [Internal Storage] 底下
+    #   181 個日期資料夾全部被歸成 OTHER，然後印出
+    #   「有檔案但沒有一個算照片或影片」—— 它們根本不是檔案。
+    folder_set = set(folders)
     report.say()
-    report.say("前 30 個項目與分類：")
-    for name in names[:30]:
-        report.say("    {:<34} {}".format(name, categorize(name).name))
-    if len(names) > 30:
-        report.say("    …（其餘 {} 項省略）".format(len(names) - 30))
+    report.say("前 30 個項目（共 {} 個：{} 個資料夾、{} 個檔案）：".format(
+        len(everything), len(folders), len(files)))
+    for name in everything[:30]:
+        if name in folder_set:
+            report.say("    {:<34} [資料夾]".format(name))
+        else:
+            report.say("    {:<34} {}".format(name, categorize(name).name))
+    if len(everything) > 30:
+        report.say("    …（其餘 {} 項省略）".format(len(everything) - 30))
 
-    media = [n for n in names if categorize(n) & MEDIA]
+    media = [n for n in files if categorize(n) & MEDIA]
     report.say()
     report.say("符合「照片 + 影片」的：{} 個（程式會備份的就是這些）".format(len(media)))
-    if names and not media:
+    if not files:
+        report.say("（這個資料夾底下只有子資料夾、沒有檔案 —— 這很正常，"
+                   "請改成勾選它底下的資料夾。）")
+    elif not media:
         report.say("!! 有檔案但沒有一個算照片或影片 —— "
                    "副檔名可能是程式沒涵蓋的，請回報上面的清單。")
 

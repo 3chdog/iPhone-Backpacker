@@ -163,14 +163,10 @@ def main():
     host.start()
     window.show()
 
-    # 首次啟動的引導。放在 show() 之後 —— 主視窗要先出現在後面，
-    # 使用者關掉說明就能直接操作。
-    dialogs.maybe_show_guide(window)
-
-    # 視窗已經顯示之後才發請求 —— 使用者看到的是「立刻開啟」而不是「卡兩秒」。
-    window.request_detect.emit()
-    window.request_roots.emit()
-
+    # ★★ 啟動耗時一定要在**任何互動之前**量完（2026-09-14 修）。
+    #   實測回報：首次啟動會跳出使用說明，而它是 modal 的；舊版把量測放在
+    #   它後面，於是 log 寫出「我們的初始化 39556 ms」—— 那 39 秒其實是
+    #   使用者在讀說明。每一份首次使用者的災情回報都會被這個數字誤導。
     import_ms = getattr(sys.modules["__main__"], "_IMPORT_MS", None)
     if import_ms is not None:
         # 實測（2026-08-27）：import 約 2100~2400 ms，之後的初始化只有約 80 ms。
@@ -181,6 +177,15 @@ def main():
         log.info("啟動耗時：import %.0f ms + 我們的初始化 %.0f ms（合計 %.0f ms）",
                  import_ms, max(total_ms - import_ms, 0.0), total_ms)
     log.info("啟動完成，log 檔：%s", log_path)
+
+    # 首次啟動的引導。放在 show() 之後 —— 主視窗要先出現在後面，
+    # 使用者關掉說明就能直接操作。
+    # ★ 這是 modal 的，會一直卡到使用者關掉為止，所以務必在量測之後。
+    dialogs.maybe_show_guide(window)
+
+    # 視窗已經顯示之後才發請求 —— 使用者看到的是「立刻開啟」而不是「卡兩秒」。
+    window.request_detect.emit()
+    window.request_roots.emit()
     return app.exec()
 
 

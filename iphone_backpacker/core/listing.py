@@ -78,7 +78,7 @@ class NamespaceCache:
 # 瀏覽路徑
 # --------------------------------------------------------------------------
 
-def list_subfolders(abs_pidl, cache=None, report=None):
+def list_subfolders(abs_pidl, cache=None, report=None, verify_empty=None):
     """只列舉子資料夾。樹狀節點展開時唯一該呼叫的東西。
 
     ★ 不列舉檔案、不取 details、不取縮圖。
@@ -99,7 +99,8 @@ def list_subfolders(abs_pidl, cache=None, report=None):
     entries = [
         FileEntry(name=name, is_dir=True, abs_pidl=child_abs)
         for child_abs, name, _ in shell_ns.iter_entries(
-            abs_pidl, flags=shell_ns.FOLDERS_ONLY, report=report
+            abs_pidl, flags=shell_ns.FOLDERS_ONLY, report=report,
+            verify_empty=verify_empty
         )
     ]
     entries.sort(key=lambda e: e.key)

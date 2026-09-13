@@ -46,7 +46,7 @@ from . import copysink, shell_ns
 from .errors import (BackpackerError, DestinationError, OperationCancelled,
                      ShellError)
 from .filters import MEDIA, describe
-from .listing import FileEntry, iter_files
+from .listing import FileEntry, iter_files, list_subfolders
 from .naming import safe_folder_name
 
 log = logging.getLogger(__name__)
@@ -252,6 +252,32 @@ def _perform(pfo):
     return False, any_aborted
 
 
+def _zero_explained_by_subfolders(source, enum_report):
+    """「0 個檔案而且很慢」是不是被子資料夾解釋掉了。
+
+    ★★ `SHCONTF_NONFOLDERS` 是**事後過濾**（決策 D10）：provider 會先把
+      所有項目實體化，再把不是檔案的濾掉。所以一個底下有 181 個子資料夾、
+      0 個檔案的節點（iPhone 的 `Internal Storage` 本身就是），
+      「只列檔案」**必然**很慢，而那個慢跟連線狀態一點關係都沒有。
+
+      實測（2026-09-14）：`Internal Storage` 的「只列檔案」0 項花了 1542 ms，
+      被標成「這個 0 不可信」—— 假警報。我們這一輪的整個重點就是消滅
+      誤導性的訊息，那就不能自己製造新的。
+
+    ★ 只有在**已經判定可疑**時才會呼叫，所以多付一次列舉是划算的；
+      正常備份路徑完全不會走到這裡。
+    """
+    if enum_report.errors:
+        return False        # 出過錯 —— 那不是「慢」能解釋的
+    if enum_report.status is shell_ns.EnumStatus.EMPTY_WAS_WRONG:
+        return False        # 第一次說謊過 —— 更不能信
+    try:
+        return bool(list_subfolders(source.abs_pidl))
+    except BackpackerError as exc:
+        log.debug("確認「%s」有沒有子資料夾時失敗：%s", source.name, exc)
+        return False
+
+
 def run_copy(plan, categories=MEDIA, *, owner_hwnd=None,
              progress=None, cancel=None):
     """執行備份。**必須在 worker thread 且已進入 COM apartment。**
@@ -344,9 +370,15 @@ def run_copy(plan, categories=MEDIA, *, owner_hwnd=None,
                 jobs.append((source, dest_sub, pending))
             elif enum_report.suspicious_zero:
                 # ★ 0 個檔案，而且那個 0 不可信 —— 絕不能當成「沒東西要備份」。
-                log.warning("「%s」回報 0 個檔案，但那個 0 很可疑：%s",
-                            source.name, enum_report.describe())
-                report.suspicious_empty.append(source.name)
+                #   但先確認這個「慢」是不是有無害的解釋（見下面那支函式）。
+                if _zero_explained_by_subfolders(source, enum_report):
+                    log.info("「%s」沒有檔案、只有子資料夾，"
+                             "「只列檔案」慢是正常的（%s）",
+                             source.name, enum_report.describe())
+                else:
+                    log.warning("「%s」回報 0 個檔案，但那個 0 很可疑：%s",
+                                source.name, enum_report.describe())
+                    report.suspicious_empty.append(source.name)
         notify()
     except OperationCancelled:
         report.aborted = True

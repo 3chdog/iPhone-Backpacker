@@ -376,7 +376,7 @@ def _iter_pairs(abs_pidl, flags, batch, verify_empty, report):
     if seen:
         report._finish(len(seen), started,
                        EnumStatus.RECOVERED if report.errors else EnumStatus.OK)
-        _log_enum(report)
+        _log_enum(report, abs_pidl)
         return
 
     # ---- 0 項：要不要再驗一次？ ----
@@ -387,7 +387,7 @@ def _iter_pairs(abs_pidl, flags, batch, verify_empty, report):
         report._finish(0, started,
                        EnumStatus.NULL_ENUMERATOR if report.null_enumerator
                        else EnumStatus.EMPTY)
-        _log_enum(report)
+        _log_enum(report, abs_pidl)
         return
 
     report.attempts += 1
@@ -407,21 +407,38 @@ def _iter_pairs(abs_pidl, flags, batch, verify_empty, report):
 
     report._finish(len(seen), started,
                    EnumStatus.EMPTY_WAS_WRONG if seen else EnumStatus.EMPTY_VERIFIED)
-    _log_enum(report)
+    _log_enum(report, abs_pidl)
 
 
-def _log_enum(report):
+def _log_enum(report, abs_pidl=None):
     """把可疑的列舉結果寫進 log。
 
     ★ 正常結果寫 debug（量太大），可疑的一律 warning ——
       收到災情回報時，log 裡必須看得出「那個 0 是哪一種 0」。
+
+    ★★ 可疑的時候才去問節點名稱（2026-09-14）。
+      實測回報裡出現過「列舉結果：0 項 / 1598 ms / 嘗試 2 次」——
+      資訊很完整，但**看不出是哪個資料夾**，等於少了一半的價值。
+      取名字要一次 COM 來回，所以只在真的要寫 warning 時才付這個錢；
+      正常路徑一毛都不多花。
     """
-    if report.status in (EnumStatus.EMPTY_WAS_WRONG, EnumStatus.FAILED):
-        log.warning("列舉結果可疑：%s", report.describe())
-    elif report.status is EnumStatus.RECOVERED or report.suspicious_zero:
-        log.warning("列舉結果：%s", report.describe())
-    else:
+    suspicious = (report.status in (EnumStatus.EMPTY_WAS_WRONG, EnumStatus.FAILED)
+                  or report.status is EnumStatus.RECOVERED
+                  or report.suspicious_zero)
+    if not suspicious:
         log.debug("列舉結果：%s", report.describe())
+        return
+
+    where = ""
+    if abs_pidl:
+        try:
+            where = "「{}」".format(display_name(abs_pidl))
+        except Exception:      # noqa: BLE001 - 取不到名字不能讓記錄失敗
+            where = ""
+    if report.status in (EnumStatus.EMPTY_WAS_WRONG, EnumStatus.FAILED):
+        log.warning("列舉結果可疑%s：%s", where, report.describe())
+    else:
+        log.warning("列舉結果%s：%s", where, report.describe())
 
 
 def iter_child_pidls(abs_pidl, flags=EVERYTHING, batch=DEFAULT_BATCH,
