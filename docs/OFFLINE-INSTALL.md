@@ -115,3 +115,38 @@ pywin32-306-cp312-cp312-win_amd64.whl
 
 裝錯版本 pip 會直接拒絕，訊息通常是
 `is not a supported wheel on this platform`。
+
+---
+
+## D. 選配：comtypes（v1.0.2-rc.2 起）
+
+只給 **WPD 診斷探針**用（`core/wpd_probe.py`）。**沒有它程式完全正常**，
+只是診斷報告會少「WPD 探針」那一段，而那一段能分辨
+「裝置被其他軟體佔用」「裝置當掉」「資料夾真的是空的」——
+Shell 那條路把這三種全部壓成同一個 `0x8007001E`。
+
+| 套件 | 檔名 | 下載處 |
+|---|---|---|
+| comtypes 1.4.6 | `comtypes-1.4.6-py3-none-any.whl` | [PyPI](https://pypi.org/project/comtypes/1.4.6/#files) |
+
+**這是 universal wheel**（`py3-none-any`）—— 不分 Python 版本、不分 32/64 位元，
+一個檔案到處都能裝，也不需要編譯器。
+
+```
+pip install comtypes-1.4.6-py3-none-any.whl
+```
+
+### 沒裝會怎樣
+
+打包時 PyInstaller 會印兩行 `ERROR: Hidden import 'comtypes.client' not found`，
+**但打包會正常完成**，產出的 exe 一切功能正常。
+執行時診斷報告的「六、WPD 探針」那一段會寫「沒有 comtypes」。
+
+如果你不想看到那兩行 ERROR，把 `iphone_backpacker.spec` 的 `hiddenimports`
+裡這三行刪掉即可：
+
+```
+"comtypes",
+"comtypes.client",
+"comtypes.gen",
+```

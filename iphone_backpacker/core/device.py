@@ -234,7 +234,11 @@ def find_portable_devices():
 
 
 def _classify(parsing, attrs):
-    """判斷一個「本機」底下的節點是不是可攜式裝置。
+    r"""判斷一個「本機」底下的節點是不是可攜式裝置。
+
+    ★ 這個 docstring 前面有 r 前綴（raw string），因為內文寫到了磁碟機路徑。
+      非 raw 字串裡「反斜線 + 空白」是無效的跳脫序列：Python 3.12 只發
+      SyntaxWarning（打包 log 裡看得到），但未來版本會直接變成 SyntaxError。
 
     回傳 (Confidence, 判斷依據的文字說明)。文字會寫進 log 與診斷報告，
     收到災情回報時才知道是哪一條規則做的決定。
