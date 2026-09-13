@@ -12,4 +12,6 @@ PySide6==6.7.3
 # ★ 沒裝也完全不影響備份功能 —— 診斷報告只會少「WPD 探針」那一段。
 #   它在 runtime 產生 COM wrapper，與 PyInstaller 有已知衝突，
 #   所以程式裡每一步都獨立 try/except，探針掛掉不會影響任何其他功能。
-comtypes==1.4.6
+# （2026-09-13 查 PyPI 的最新版；本專案尚未在 Windows 上實測過任一版本，
+#   選最新是因為它比 1.4.6 多了一年半的 PyInstaller / Python 3.12 修正。）
+comtypes==1.4.16

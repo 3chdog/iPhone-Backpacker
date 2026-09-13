@@ -127,13 +127,13 @@ Shell 那條路把這三種全部壓成同一個 `0x8007001E`。
 
 | 套件 | 檔名 | 下載處 |
 |---|---|---|
-| comtypes 1.4.6 | `comtypes-1.4.6-py3-none-any.whl` | [PyPI](https://pypi.org/project/comtypes/1.4.6/#files) |
+| comtypes 1.4.16 | `comtypes-1.4.16-py3-none-any.whl` | [PyPI](https://pypi.org/project/comtypes/1.4.16/#files) |
 
 **這是 universal wheel**（`py3-none-any`）—— 不分 Python 版本、不分 32/64 位元，
 一個檔案到處都能裝，也不需要編譯器。
 
 ```
-pip install comtypes-1.4.6-py3-none-any.whl
+pip install comtypes-1.4.16-py3-none-any.whl
 ```
 
 ### 沒裝會怎樣
