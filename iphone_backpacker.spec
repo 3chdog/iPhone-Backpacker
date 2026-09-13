@@ -75,8 +75,18 @@ a = Analysis(
         # pywin32 的 shell 擴充是動態載入的，PyInstaller 不一定找得到
         "win32com.shell.shell",
         "win32com.shell.shellcon",
+        "win32com.server.policy",   # IFileOperationProgressSink 的 gateway（D19）
         "pythoncom",
         "pywintypes",
+        # ★ 選配：WPD 診斷探針（D21）。comtypes 會在 **runtime** 產生 COM
+        #   wrapper 到 comtypes/gen，這與凍結後的環境有已知衝突。
+        #   core/wpd_probe.py 的每一個 import 都在函式裡、每一步獨立
+        #   try/except，所以**就算這裡收不齊也只是診斷報告少一段**，
+        #   絕不會影響備份。若打包時因為 comtypes 出錯，
+        #   直接把下面三行刪掉就好。
+        "comtypes",
+        "comtypes.client",
+        "comtypes.gen",
     ],
     hookspath=[],
     hooksconfig={},

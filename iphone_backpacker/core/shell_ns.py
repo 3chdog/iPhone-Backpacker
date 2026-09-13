@@ -216,6 +216,13 @@ class EnumReport:
     null_enumerator: bool = False
     errors: List[str] = field(default_factory=list)
 
+    #: 列舉有沒有跑到底。★ 呼叫端可以提早放棄（`is_empty()` 拿到第一筆就
+    #: 回傳、`folder_has_media()` 找到第一個符合的就早退），那種情況下
+    #: 這份紀錄只反映「看過的那幾筆」，不能當成完整清單的結論。
+    #: 沒有這個欄位的話，被放棄的 report 會停在預設值 `OK / 0 項`，
+    #: 看起來像「正常列舉出 0 項」—— 那正是我們花整輪在消滅的那種謊。
+    completed: bool = False
+
     @property
     def trustworthy(self):
         """這份清單能不能當成事實看待（例如：可不可以進快取）。
@@ -224,6 +231,8 @@ class EnumReport:
           這個 provider 剛剛才示範過它會謊報 0，沒有理由相信
           它第二次給的清單就是完整的。寧可下次重列一遍。
         """
+        if not self.completed:
+            return False
         if self.status in (EnumStatus.FAILED, EnumStatus.EMPTY_WAS_WRONG):
             return False
         if self.count:
@@ -241,6 +250,8 @@ class EnumReport:
 
     def describe(self):
         """一行文字，給 log 與診斷報告用。"""
+        if not self.completed:
+            return "{} 項（列舉沒有跑到底，呼叫端提早結束）".format(self.count)
         parts = ["{} 項".format(self.count), "{:.0f} ms".format(self.elapsed_ms)]
         if self.attempts > 1:
             parts.append("嘗試 {} 次".format(self.attempts))
@@ -255,6 +266,7 @@ class EnumReport:
         self.count = count
         self.elapsed_ms = (time.perf_counter() - started) * 1000.0
         self.status = status
+        self.completed = True
         return self
 
 
@@ -379,7 +391,7 @@ def _iter_pairs(abs_pidl, flags, batch, verify_empty, report):
         return
 
     report.attempts += 1
-    time.sleep(ENUM_BACKOFF_SECONDS[1])
+    time.sleep(ENUM_BACKOFF_SECONDS[min(1, len(ENUM_BACKOFF_SECONDS) - 1)])
     try:
         for folder, rel_pidl in _enum_once(abs_pidl, flags, batch):
             key = tuple(rel_pidl)

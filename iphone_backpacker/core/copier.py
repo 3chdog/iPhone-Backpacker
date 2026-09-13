@@ -295,6 +295,7 @@ def run_copy(plan, categories=MEDIA, *, owner_hwnd=None,
             existing = _local_index(dest_sub)
             enum_report = shell_ns.EnumReport()
             pending = []
+            skipped_here = 0
             try:
                 for entry in iter_files(source.abs_pidl, categories,
                                         report=enum_report):
@@ -308,6 +309,7 @@ def run_copy(plan, categories=MEDIA, *, owner_hwnd=None,
                     #   否則一個殘缺檔會永遠擋住自己的重試。
                     if existing.get(entry.key):
                         report.skipped_existing.append(entry.name)
+                        skipped_here += 1
                         state.skipped_existing = len(report.skipped_existing)
                         continue
                     pending.append(entry)
@@ -327,8 +329,10 @@ def run_copy(plan, categories=MEDIA, *, owner_hwnd=None,
                 continue
 
             report.enum_notes.append((source.name, enum_report.describe()))
+            # ★ 「跳過」以前印的是 len(existing)（整個目的地資料夾的檔案數），
+            #   那在目的地有舊檔案時會虛報。改成這一輪真的跳過的數量。
             log.info("「%s」：待複製 %d 個、跳過 %d 個（列舉：%s）",
-                     source.name, len(pending), len(existing),
+                     source.name, len(pending), skipped_here,
                      enum_report.describe())
 
             if pending:

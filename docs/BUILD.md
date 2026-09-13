@@ -120,3 +120,23 @@ EXCLUDES = []
 
 第一次啟動因為 Windows 還沒把那些 DLL 讀進檔案快取，會比後續慢很多，
 這是正常的。
+
+## 關於 comtypes（v1.0.2-rc.2 起）
+
+`requirements.txt` 多了一個 **選配** 套件 `comtypes`，只給 WPD 診斷探針用
+（`core/wpd_probe.py`，決策 D21）。
+
+**它壞掉不影響任何功能** —— 診斷報告只會少「WPD 探針」那一段。
+
+已知風險：comtypes 會在 **runtime** 產生 COM wrapper 到 `comtypes/gen`，
+這和 PyInstaller 的凍結環境有已知衝突。程式裡每一個 `import` 都放在函式內、
+每一步獨立 `try/except`，所以最壞的情況也只是報告少一段。
+
+**如果打包時因為 comtypes 出錯**：把 `iphone_backpacker.spec` 的
+`hiddenimports` 裡這三行刪掉再打包一次就好，其他功能完全不受影響。
+
+```
+"comtypes",
+"comtypes.client",
+"comtypes.gen",
+```

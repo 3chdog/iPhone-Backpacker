@@ -200,6 +200,28 @@ class EnumReportTests(unittest.TestCase):
         self.assertIs(report.status, shell_ns.EnumStatus.EMPTY_WAS_WRONG)
         self.assertTrue(report.null_enumerator)
 
+    # ---- 呼叫端提早放棄 ----
+
+    def test_abandoned_enumeration_is_not_trustworthy(self):
+        """★ `is_empty()` / `folder_has_media()` 拿到第一筆就早退。
+
+        那種情況下這份紀錄只看過幾筆，**絕不能看起來像
+        「正常列舉出 0 項」** —— 那正是我們整輪在消滅的那種謊。
+        """
+        script = _Script([[b"a", b"b", b"c"]])
+        shell_ns.bind_folder = script.bind
+        report = shell_ns.EnumReport()
+        for _ in shell_ns.iter_child_pidls(ROOT, flags=shell_ns.EVERYTHING,
+                                           batch=1, report=report):
+            break
+        self.assertFalse(report.completed)
+        self.assertFalse(report.trustworthy)
+        self.assertIn("沒有跑到底", report.describe())
+
+    def test_completed_flag_set_on_normal_path(self):
+        _names, report, _script = self.run_enum([[b"a"]])
+        self.assertTrue(report.completed)
+
     # ---- describe() 要讓人看得出是哪一種 0 ----
 
     def test_describe_mentions_count_and_time(self):

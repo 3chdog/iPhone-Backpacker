@@ -457,6 +457,8 @@ def _describe_wpd(report):
 
     ★ 這一段失敗完全不影響程式，它只是報告的一段。
     """
+    report.say("（這一段會實際跟裝置要一次連線，可能要等幾秒。）")
+    report.say()
     result = wpd_probe.probe()
 
     if not result.available:
