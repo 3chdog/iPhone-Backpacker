@@ -18,7 +18,7 @@ from typing import List, Optional, Tuple
 from win32com.shell import shellcon
 
 from . import shell_ns
-from .errors import OperationCancelled
+from .errors import BackpackerError, OperationCancelled
 from .filters import MEDIA
 from .listing import FileEntry, folder_has_media, is_empty, list_subfolders
 
@@ -36,6 +36,14 @@ class DeviceStatus(Enum):
     #: 有多個候選但無法確定哪一個是使用者的手機。
     #: 這時候**不猜** —— 請使用者自己在樹狀清單裡選（決策 D17）。
     AMBIGUOUS = auto()
+    #: ★ 裝置找到了、而且確定是可攜式裝置，但**讀不到內容**。
+    #:
+    #: 為什麼要跟 NOT_FOUND 分開（2026-09-13，民眾B 案）：
+    #: 16:49 那次 probe() 拿到 0x8007001E，而 worker 把它轉成 NOT_FOUND，
+    #: 於是橫幅顯示「沒有自動偵測到 iPhone，請確認 USB 線接好了、手機已解鎖」——
+    #: 但事實是我們**確實找到了 iPhone，還確認了它有 WPD 證據**，
+    #: 只是讀不到。叫使用者去檢查線和解鎖是把他推往錯誤的方向。
+    READ_FAILED = auto()
 
 
 class Confidence(Enum):
@@ -121,6 +129,23 @@ def status_message(detection):
                 "（其他項目可能是別的軟體掛在「本機」底下的，例如手機管理工具。）"
                 .format(listed))
 
+    if status is DeviceStatus.READ_FAILED:
+        # ★ 這段訊息刻意**不提**「請確認 USB 線接好、手機已解鎖」——
+        #   我們明明已經找到裝置了，叫使用者去檢查那些只會讓他白忙。
+        #   真正有效的動作是「重新整理裝置」（會重建連線），其次才是重插。
+        return ("找到「{}」了，但**讀不到裡面的內容**。\n"
+                "\n"
+                "這通常是裝置連線進入了異常狀態，**不是**你的手機或線材壞了。\n"
+                "\n"
+                "請依序試：\n"
+                "1. 按一次 **「重新整理裝置」**（會重新建立連線，多半這樣就好）\n"
+                "2. 還是不行 → 把 USB 線拔掉重插，等十幾秒再按一次\n"
+                "3. 如果電腦上裝了會存取 iPhone 的其他軟體"
+                "（手機管理／備份工具之類），請先把它完全關閉\n"
+                "\n"
+                "如果一直是這樣，請按「產生診斷報告」並把檔案回報給開發者。"
+                .format(name or "裝置"))
+
     if status is DeviceStatus.NOT_FOUND:
         # ★ 措辭很重要：自動偵測失敗**不代表不能用**。
         #   左邊的樹狀清單走的是另一條路（純列舉，不看屬性），
@@ -170,9 +195,13 @@ def find_portable_devices():
     devices: List[Device] = []
     diagnostics = []
 
+    # ★ 「本機」這一層也要記可信度。民眾B 15:55 那次 Apple iPhone 沒出現在
+    #   候選裡，其中一個假設就是這一層的列舉被靜默截斷了（CopyTrans 是第 5 項、
+    #   Apple iPhone 是第 9 項）。沒有這份紀錄就永遠無法證實或推翻。
+    enum_report = shell_ns.EnumReport()
     for child_abs, name, attrs, parsing in shell_ns.iter_entries(
         this_pc, flags=shell_ns.EVERYTHING,
-        want_attributes=True, want_parsing=True,
+        want_attributes=True, want_parsing=True, report=enum_report,
     ):
         confidence, reason = _classify(parsing, attrs)
         diagnostics.append((name, parsing, attrs, confidence, reason))
@@ -185,14 +214,21 @@ def find_portable_devices():
                               confidence=confidence, reason=reason))
         log.info("候選裝置：%s（%s：%s）", name, confidence.name, reason)
 
+    # ★★ 一律把每一個節點的判定寫進 log，不再只在「零候選」時才寫
+    #   （2026-09-13）。舊版只在 `not devices` 時 dump，結果民眾B 的
+    #   15:55 那次**只看到 CopyTrans Studio、Apple iPhone 整個消失**，
+    #   而因為候選數不是 0，我們完全沒有留下任何可以回答「iPhone 去哪了」
+    #   的紀錄。被排除的節點本身就是證據，不能只在全軍覆沒時才記。
+    log.info("「本機」底下共 %d 個節點，其中 %d 個是候選裝置（列舉：%s）：",
+             len(diagnostics), len(devices), enum_report.describe())
+    for name, parsing, attrs, confidence, reason in diagnostics:
+        log.info("    %-24s %-9s attrs=%s parsing=%s（%s）",
+                 name, confidence.name, shell_ns.describe_attributes(attrs),
+                 "None（讀不到）" if parsing is None
+                 else (parsing or "（空字串）"),
+                 reason)
     if not devices:
-        log.warning("沒有偵測到可攜式裝置。「本機」底下的節點與判斷依據：")
-        for name, parsing, attrs, confidence, reason in diagnostics:
-            log.warning("    %-24s attrs=%s parsing=%s → %s（%s）",
-                        name, shell_ns.describe_attributes(attrs),
-                        "None（讀不到）" if parsing is None
-                        else (parsing or "（空字串）"),
-                        confidence.name, reason)
+        log.warning("沒有偵測到可攜式裝置 —— 判斷依據見上面那份清單。")
 
     return devices
 
@@ -244,16 +280,48 @@ def probe(device):
 
     iPhone 鎖定或未信任時，Shell 會把 Internal Storage 列成空的而不報錯，
     所以要實際往下探一層才知道。
+
+    ★★ 「空的」有兩種，訊息完全不同，絕不能混（2026-09-13）：
+
+        真的空 → 手機沒解鎖 / 沒點信任 → LOCKED_OR_UNTRUSTED
+        讀不到 → 裝置連線出問題       → READ_FAILED
+
+      舊版兩種都回 LOCKED_OR_UNTRUSTED，於是連線壞掉時會叫使用者
+      去按一個他早就按過的「信任」。現在靠 EnumReport 分開。
     """
-    storages = list_subfolders(device.abs_pidl)
+    report = shell_ns.EnumReport()
+    try:
+        storages = list_subfolders(device.abs_pidl, report=report)
+    except BackpackerError as exc:
+        log.warning("裝置「%s」的儲存區列不出來：%s", device.name, exc)
+        return DeviceStatus.READ_FAILED
+
     if not storages:
-        log.warning("裝置「%s」底下沒有任何儲存區 —— 可能未解鎖或未信任", device.name)
+        if report.suspicious_zero:
+            log.warning("裝置「%s」的儲存區清單可疑，不採信這個 0：%s",
+                        device.name, report.describe())
+            return DeviceStatus.READ_FAILED
+        log.warning("裝置「%s」底下沒有任何儲存區 —— 可能未解鎖或未信任（%s）",
+                    device.name, report.describe())
         return DeviceStatus.LOCKED_OR_UNTRUSTED
 
+    suspicious = False
     for storage in storages:
-        if not is_empty(storage.abs_pidl):
+        sub = shell_ns.EnumReport()
+        try:
+            empty = is_empty(storage.abs_pidl, report=sub)
+        except BackpackerError as exc:
+            log.warning("裝置「%s」的儲存區「%s」讀取失敗：%s",
+                        device.name, storage.name, exc)
+            return DeviceStatus.READ_FAILED
+        if not empty:
             return DeviceStatus.OK
+        if sub.suspicious_zero:
+            suspicious = True
+            log.warning("儲存區「%s」的 0 很可疑：%s", storage.name, sub.describe())
 
+    if suspicious:
+        return DeviceStatus.READ_FAILED
     log.warning("裝置「%s」的儲存區全部是空的 —— 可能未解鎖或未信任", device.name)
     return DeviceStatus.LOCKED_OR_UNTRUSTED
 
