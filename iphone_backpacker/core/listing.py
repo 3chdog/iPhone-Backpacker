@@ -78,25 +78,37 @@ class NamespaceCache:
 # 瀏覽路徑
 # --------------------------------------------------------------------------
 
-def list_subfolders(abs_pidl, cache=None):
+def list_subfolders(abs_pidl, cache=None, report=None, verify_empty=None):
     """只列舉子資料夾。樹狀節點展開時唯一該呼叫的東西。
 
     ★ 不列舉檔案、不取 details、不取縮圖。
+
+    ★★ 重驗策略用 `verify_empty=None`（只有「慢速的 0」才重驗）——
+      這裡是**瀏覽路徑**，要守 0.5 秒的效能契約（D8）。
+      344 個日期資料夾裡本來就有很多是空的，每一個都重驗一次
+      等於把展開的成本加倍，而快速的 0 幾乎一定是真的空。
+      慢速的 0（民眾B 那種 8.8 秒）才值得付重驗的代價。
     """
     if cache is not None:
         cached = cache.get_subfolders(abs_pidl)
         if cached is not None:
             return cached
 
+    if report is None:
+        report = shell_ns.EnumReport()
     entries = [
         FileEntry(name=name, is_dir=True, abs_pidl=child_abs)
         for child_abs, name, _ in shell_ns.iter_entries(
-            abs_pidl, flags=shell_ns.FOLDERS_ONLY
+            abs_pidl, flags=shell_ns.FOLDERS_ONLY, report=report,
+            verify_empty=verify_empty
         )
     ]
     entries.sort(key=lambda e: e.key)
 
-    if cache is not None:
+    # ★ 不可信的清單不進快取 —— 否則使用者按「重新整理」之前都會一直看到
+    #   那份假清單，而快取的存活範圍是一整個 session。
+    #   「可疑的 0」與「騙過我們一次之後才給的清單」兩種都不收。
+    if cache is not None and report.trustworthy:
         cache.put_subfolders(abs_pidl, entries)
     return entries
 
@@ -128,14 +140,21 @@ def folder_has_media(abs_pidl, categories=MEDIA, probe_limit=200,
     return False
 
 
-def is_empty(abs_pidl):
+def is_empty(abs_pidl, report=None):
     """節點下有沒有任何東西。
 
     用來偵測「iPhone 沒解鎖 / 沒點信任」—— 那種情況 Shell 會把資料夾
     列舉成空的而不是回報錯誤，不主動判斷的話使用者只會看到一片空白。
+
+    ★ 這裡 `verify_empty=True`：它只在 probe() 裡對少數幾個儲存區呼叫，
+      成本可以忽略，而它的答案要用來告訴使用者「手機沒解鎖」——
+      拿一個假的 0 去叫使用者去按信任，是會讓人白忙的誤導。
     """
+    if report is None:
+        report = shell_ns.EnumReport()
     # 只需要知道「有沒有第一筆」，批次用 1 就好（理由同 folder_has_media）。
-    for _ in shell_ns.iter_child_pidls(abs_pidl, flags=shell_ns.EVERYTHING, batch=1):
+    for _ in shell_ns.iter_child_pidls(abs_pidl, flags=shell_ns.EVERYTHING, batch=1,
+                                       verify_empty=True, report=report):
         return False
     return True
 
@@ -144,17 +163,24 @@ def is_empty(abs_pidl):
 # 複製路徑
 # --------------------------------------------------------------------------
 
-def iter_files(abs_pidl, categories=MEDIA):
+def iter_files(abs_pidl, categories=MEDIA, report=None):
     """yield 資料夾內符合分類的檔案（不含子資料夾）。
 
     ★ 回傳 generator 而非 list：讓 copier 邊列舉邊排程，
       使用者立刻看到進度，不會先卡一段無聲的列舉期。
 
+    ★★ 這裡 `verify_empty=True`，跟 list_subfolders 不一樣。
+      這是**複製路徑**：這裡的一個假 0 不是畫面不好看，是**整個資料夾
+      沒被備份，而且程式還回報成功**（2026-08-30 民眾B 的災情）。
+      多跑一次列舉的成本，跟漏備份的代價完全不是一個量級。
+
     v1 在按下「開始備份」之後才呼叫；
     v2 會改在使用者點開資料夾時呼叫來填檔案清單面板。同一支函式，只是時機不同。
     """
+    if report is None:
+        report = shell_ns.EnumReport()
     for child_abs, name, _ in shell_ns.iter_entries(
-        abs_pidl, flags=shell_ns.FILES_ONLY
+        abs_pidl, flags=shell_ns.FILES_ONLY, verify_empty=True, report=report
     ):
         if matches(name, categories):
             yield FileEntry(name=name, is_dir=False, abs_pidl=child_abs)

@@ -15,6 +15,10 @@
 import contextlib
 import logging
 import re
+import time
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import List
 
 import pythoncom
 from win32com.shell import shell, shellcon
@@ -146,67 +150,315 @@ def pidl_from_path(path):
     return as_pidl(pidl)
 
 
-def _enum_pidls(folder, flags, batch=DEFAULT_BATCH):
-    """列舉子項的相對 PIDL。
+# --------------------------------------------------------------------------
+# 列舉
+# --------------------------------------------------------------------------
 
-    batch 直接決定 Next() 一次要求幾筆 —— 在 MTP 上這是主要的成本來源，
-    見上方 DEFAULT_BATCH / PROBE_BATCH 的說明。
+class EnumStatus(Enum):
+    """一次列舉的結果分類。
 
-    pywin32 各版本 IEnumIDList.Next() 的簽章不完全一致，
-    所以先試批次、失敗再退回單筆。
+    ★★ 為什麼需要這個（2026-09-13，民眾B 案）：
+
+      `IEnumIDList` 在**語意上**就無法區分「列舉完了」與「provider 放棄了
+      但選擇不報錯」。微軟文件寫得很明白：`Next()` 回 S_FALSE 且
+      pceltFetched = 0 就是「沒有更多項目」，沒有第三種可能；而
+      `EnumObjects()` 回 S_FALSE 時**還允許**把 enumerator 設成 NULL
+      （Raymond Chen, The Old New Thing, 2024-08-12）。
+      所以「0 項」這個回答本身不帶任何可信度資訊。
+
+      這不是我們的 bug，也不是 pywin32 的 bug —— 是 API 的解析度不夠。
+      補救辦法只有一個：**自己補第二個訊號源**。我們補三個：
+        1. 耗時     —— 8.8 秒的 0 和 20 毫秒的 0 是完全不同的兩件事
+        2. 重驗     —— 重新 bind、重新列舉，兩次都 0 才採信
+        3. 旗標交叉 —— 只列檔案 + 只列資料夾 應該等於 全部（診斷報告在做）
+
+      災情實例（2026-08-30，民眾B）：13 個資料夾**各花 8.8 秒回傳 0 項**，
+      程式判定「待複製 0 個」並回報「全部已存在」—— 事實上那 3649 個檔案
+      一個都沒備份到。**把「讀不到」當成「沒有東西要備份」，
+      是備份工具最嚴重的一種錯誤。**
     """
+
+    OK = auto()                 # 至少取得 1 項，過程中沒有例外
+    RECOVERED = auto()          # 中途失敗，重建 enumerator 後成功
+    EMPTY = auto()              # 0 項，而且很快 —— 視為真的空（沒有重驗）
+    EMPTY_VERIFIED = auto()     # 0 項，重驗一次仍然是 0 —— 可信的空
+    EMPTY_WAS_WRONG = auto()    # ★ 第一次 0，重驗卻拿到東西 —— 第一次是假的
+    NULL_ENUMERATOR = auto()    # EnumObjects 回 S_FALSE / NULL（文件允許）
+    FAILED = auto()             # 所有嘗試都失敗
+
+
+# 一次列舉最多試幾輪。3 是折衷：MTP 的偶發失敗通常一次就好，
+# 試太多輪會讓「真的壞掉」的情況拖很久才告訴使用者。
+ENUM_MAX_ATTEMPTS = 3
+
+# 第 n 輪嘗試前要等多久。★ 零退避是沒有意義的重試 ——
+# 對「需要一點時間恢復」的裝置，立刻重問幾乎一定得到同樣的答案。
+ENUM_BACKOFF_SECONDS = (0.0, 0.25, 1.0)
+
+# 0 項而且花了這麼久，就不該直接相信。實測空資料夾約 20~70 ms，
+# 而民眾B 的災情是 8800 ms —— 兩者差兩個數量級，門檻放 1 秒很安全。
+SUSPICIOUS_EMPTY_MS = 1000.0
+
+
+@dataclass
+class EnumReport:
+    """一次列舉的可信度紀錄。
+
+    ★ 這個物件的存在理由就是「讓 0 說得出自己是哪一種 0」。
+      呼叫端可以不理它（預設會自己建一個丟掉，log 照樣會寫），
+      但複製路徑與診斷報告一定要看。
+    """
+
+    status: EnumStatus = EnumStatus.OK
+    count: int = 0
+    elapsed_ms: float = 0.0
+    attempts: int = 0
+    null_enumerator: bool = False
+    errors: List[str] = field(default_factory=list)
+
+    #: 列舉有沒有跑到底。★ 呼叫端可以提早放棄（`is_empty()` 拿到第一筆就
+    #: 回傳、`folder_has_media()` 找到第一個符合的就早退），那種情況下
+    #: 這份紀錄只反映「看過的那幾筆」，不能當成完整清單的結論。
+    #: 沒有這個欄位的話，被放棄的 report 會停在預設值 `OK / 0 項`，
+    #: 看起來像「正常列舉出 0 項」—— 那正是我們花整輪在消滅的那種謊。
+    completed: bool = False
+
+    @property
+    def trustworthy(self):
+        """這份清單能不能當成事實看待（例如：可不可以進快取）。
+
+        ★ `EMPTY_WAS_WRONG` 即使最後拿到了東西也算不可信 ——
+          這個 provider 剛剛才示範過它會謊報 0，沒有理由相信
+          它第二次給的清單就是完整的。寧可下次重列一遍。
+        """
+        if not self.completed:
+            return False
+        if self.status in (EnumStatus.FAILED, EnumStatus.EMPTY_WAS_WRONG):
+            return False
+        if self.count:
+            return True
+        return not self.suspicious_zero
+
+    @property
+    def suspicious_zero(self):
+        """0 項，而且有理由懷疑那是假的。"""
+        if self.count:
+            return False
+        return (self.status is EnumStatus.EMPTY_WAS_WRONG
+                or self.elapsed_ms >= SUSPICIOUS_EMPTY_MS
+                or bool(self.errors))
+
+    def describe(self):
+        """一行文字，給 log 與診斷報告用。"""
+        if not self.completed:
+            return "{} 項（列舉沒有跑到底，呼叫端提早結束）".format(self.count)
+        parts = ["{} 項".format(self.count), "{:.0f} ms".format(self.elapsed_ms)]
+        if self.attempts > 1:
+            parts.append("嘗試 {} 次".format(self.attempts))
+        if self.null_enumerator:
+            parts.append("EnumObjects 回 NULL")
+        parts.append(_ENUM_STATUS_TEXT.get(self.status, self.status.name))
+        if self.errors:
+            parts.append("錯誤：{}".format("；".join(self.errors[:3])))
+        return " / ".join(parts)
+
+    def _finish(self, count, started, status):
+        self.count = count
+        self.elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self.status = status
+        self.completed = True
+        return self
+
+
+_ENUM_STATUS_TEXT = {
+    EnumStatus.OK: "正常",
+    EnumStatus.RECOVERED: "★ 中途失敗，重建後成功",
+    EnumStatus.EMPTY: "空的（未重驗）",
+    EnumStatus.EMPTY_VERIFIED: "空的（重驗過仍是 0）",
+    EnumStatus.EMPTY_WAS_WRONG: "★★ 第一次回 0 是假的，重驗後有東西",
+    EnumStatus.NULL_ENUMERATOR: "EnumObjects 回 S_FALSE / NULL",
+    EnumStatus.FAILED: "★★ 失敗",
+}
+
+
+class _NullEnumerator(Exception):
+    """內部訊號：EnumObjects 回了 S_FALSE / NULL。不是錯誤。"""
+
+
+def _enum_once(abs_pidl, flags, batch):
+    """跑一次完整的列舉，yield (folder, rel_pidl)。
+
+    ★ 每一次嘗試都**重新 BindToObject**，而不是沿用上一次的 folder。
+      理由有兩個：
+        1. 微軟文件對「`Next()` 回錯誤之後 enumerator 還能不能用」
+           **完全沒有任何保證**。在故障的 enumerator 上重呼叫 `Next()`
+           是沒有文件支持的行為（舊版就是這樣寫的）。
+        2. 重新 bind 會重走 Desktop → 本機 → 裝置 → … 這條路，
+           那正是重新建立裝置連線的機會。
+
+      yield 出 folder 是刻意的 —— 呼叫端要用**這一輪**的 folder 去取名稱，
+      不能用上一輪那個可能已經失效的。
+    """
+    folder = bind_folder(abs_pidl)
     try:
         enumerator = folder.EnumObjects(0, flags)
     except pythoncom.com_error as exc:
         raise ShellError("列舉失敗：{}".format(exc)) from exc
-    if enumerator is None:          # 空資料夾在某些 shell extension 上會回 None
-        return
+    if enumerator is None:
+        # 文件允許：EnumObjects 回 S_FALSE 時可以不給 enumerator。
+        # 意思是「沒有項目」，不是錯誤 —— 但我們要記下來，
+        # 因為它和「列舉出 0 項」在成因上不一樣。
+        raise _NullEnumerator()
 
-    seen = 0
     while True:
         try:
             chunk = enumerator.Next(batch)
         except TypeError:
+            # pywin32 各版本 Next() 的簽章不完全一致。
             batch = None
             chunk = enumerator.Next()
-        except pythoncom.com_error as exc:
-            # ★★ 這裡以前是 log.warning 之後直接 return，也就是**靜默截斷清單**。
-            #   對備份工具來說那是最糟的失敗方式：iter_files() 被截斷後，
-            #   copier 會判定「待複製 0 個」而**靜默跳過整個資料夾不備份**，
-            #   使用者卻以為備份完成了。
-            #   MTP 偶發性失敗是真的存在，所以先重試一次，仍然失敗就 raise，
-            #   讓使用者看到錯誤並按「重新整理裝置」，而不是拿到不完整的資料。
-            log.warning("列舉中斷（已取得 %d 項）：%s —— 重試一次", seen, exc)
-            try:
-                chunk = enumerator.Next(batch)
-            except pythoncom.com_error as exc2:
-                raise ShellError(
-                    "列舉中斷，清單不完整（已取得 {} 項）：{}。"
-                    "請按「重新整理裝置」，或把 USB 線拔掉重插。".format(seen, exc2)
-                ) from exc2
         if not chunk:
             return
         if not isinstance(chunk, (list, tuple)):
             chunk = [chunk]
         for rel_pidl in chunk:
-            seen += 1
-            yield rel_pidl
+            yield folder, rel_pidl
 
 
-def iter_child_pidls(abs_pidl, flags=EVERYTHING, batch=DEFAULT_BATCH):
+def _iter_pairs(abs_pidl, flags, batch, verify_empty, report):
+    """列舉一層，yield (folder, rel_pidl)，並把可信度寫進 report。
+
+    verify_empty:
+        None  只有「慢速的 0」才重驗 —— 瀏覽路徑用，保護 0.5 秒的效能契約
+        True  0 項一律重驗 —— **複製路徑用**，那裡的假 0 等於漏備份
+        False 不重驗
+    """
+    seen = set()
+    started = time.perf_counter()
+    completed = False
+
+    for attempt in range(1, ENUM_MAX_ATTEMPTS + 1):
+        report.attempts = attempt
+        delay = ENUM_BACKOFF_SECONDS[min(attempt - 1, len(ENUM_BACKOFF_SECONDS) - 1)]
+        if delay:
+            time.sleep(delay)
+        try:
+            for folder, rel_pidl in _enum_once(abs_pidl, flags, batch):
+                key = tuple(rel_pidl)
+                # ★ 用 PIDL 去重，不用「跳過前 N 筆」——
+                #   Shell 不保證兩次列舉的順序一致，靠順序會拿到錯的東西。
+                #   （舊 CLI 版的 zip bug 就是這樣來的。）
+                if key in seen:
+                    continue
+                seen.add(key)
+                yield folder, rel_pidl
+        except _NullEnumerator:
+            report.null_enumerator = True
+            completed = True
+            break
+        except (pythoncom.com_error, ShellError) as exc:
+            report.errors.append(str(exc))
+            log.warning("列舉第 %d 次嘗試失敗（目前已取得 %d 項）：%s",
+                        attempt, len(seen), exc)
+            continue
+        completed = True
+        break
+
+    if not completed:
+        report._finish(len(seen), started, EnumStatus.FAILED)
+        log.error("列舉失敗：%s", report.describe())
+        raise ShellError(
+            "列舉失敗，清單不完整（已取得 {} 項、試了 {} 次）：{}。"
+            "請按「重新整理裝置」，或把 USB 線拔掉重插。".format(
+                len(seen), report.attempts,
+                report.errors[-1] if report.errors else "未知錯誤"))
+
+    if seen:
+        report._finish(len(seen), started,
+                       EnumStatus.RECOVERED if report.errors else EnumStatus.OK)
+        _log_enum(report, abs_pidl)
+        return
+
+    # ---- 0 項：要不要再驗一次？ ----
+    elapsed = (time.perf_counter() - started) * 1000.0
+    want_verify = (verify_empty is True
+                   or (verify_empty is None and elapsed >= SUSPICIOUS_EMPTY_MS))
+    if not want_verify:
+        report._finish(0, started,
+                       EnumStatus.NULL_ENUMERATOR if report.null_enumerator
+                       else EnumStatus.EMPTY)
+        _log_enum(report, abs_pidl)
+        return
+
+    report.attempts += 1
+    time.sleep(ENUM_BACKOFF_SECONDS[min(1, len(ENUM_BACKOFF_SECONDS) - 1)])
+    try:
+        for folder, rel_pidl in _enum_once(abs_pidl, flags, batch):
+            key = tuple(rel_pidl)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield folder, rel_pidl
+    except _NullEnumerator:
+        report.null_enumerator = True
+    except (pythoncom.com_error, ShellError) as exc:
+        report.errors.append(str(exc))
+        log.warning("0 項重驗時失敗：%s", exc)
+
+    report._finish(len(seen), started,
+                   EnumStatus.EMPTY_WAS_WRONG if seen else EnumStatus.EMPTY_VERIFIED)
+    _log_enum(report, abs_pidl)
+
+
+def _log_enum(report, abs_pidl=None):
+    """把可疑的列舉結果寫進 log。
+
+    ★ 正常結果寫 debug（量太大），可疑的一律 warning ——
+      收到災情回報時，log 裡必須看得出「那個 0 是哪一種 0」。
+
+    ★★ 可疑的時候才去問節點名稱（2026-09-14）。
+      實測回報裡出現過「列舉結果：0 項 / 1598 ms / 嘗試 2 次」——
+      資訊很完整，但**看不出是哪個資料夾**，等於少了一半的價值。
+      取名字要一次 COM 來回，所以只在真的要寫 warning 時才付這個錢；
+      正常路徑一毛都不多花。
+    """
+    suspicious = (report.status in (EnumStatus.EMPTY_WAS_WRONG, EnumStatus.FAILED)
+                  or report.status is EnumStatus.RECOVERED
+                  or report.suspicious_zero)
+    if not suspicious:
+        log.debug("列舉結果：%s", report.describe())
+        return
+
+    where = ""
+    if abs_pidl:
+        try:
+            where = "「{}」".format(display_name(abs_pidl))
+        except Exception:      # noqa: BLE001 - 取不到名字不能讓記錄失敗
+            where = ""
+    if report.status in (EnumStatus.EMPTY_WAS_WRONG, EnumStatus.FAILED):
+        log.warning("列舉結果可疑%s：%s", where, report.describe())
+    else:
+        log.warning("列舉結果%s：%s", where, report.describe())
+
+
+def iter_child_pidls(abs_pidl, flags=EVERYTHING, batch=DEFAULT_BATCH,
+                     verify_empty=None, report=None):
     """只列舉子項的絕對 PIDL，不取顯示名稱。
 
     給效能量測與「只需要數量/位置、不需要名字」的場合用。
     GetDisplayNameOf 在 MTP 上是每個項目一次來回，佔比可能不小，
     所以把「有沒有取名字」拆成兩支函式才量得出來。
     """
-    folder = bind_folder(abs_pidl)
-    for rel_pidl in _enum_pidls(folder, flags, batch):
+    if report is None:
+        report = EnumReport()
+    for _folder, rel_pidl in _iter_pairs(abs_pidl, flags, batch,
+                                         verify_empty, report):
         yield combine(abs_pidl, rel_pidl)
 
 
 def iter_entries(abs_pidl, flags=EVERYTHING, want_attributes=False,
-                 want_parsing=False, batch=DEFAULT_BATCH):
+                 want_parsing=False, batch=DEFAULT_BATCH,
+                 verify_empty=None, report=None):
     """列舉一層，yield (child_abs_pidl, name, attributes)。
 
     want_attributes=False 時 attributes 為 None。
@@ -216,8 +468,11 @@ def iter_entries(abs_pidl, flags=EVERYTHING, want_attributes=False,
     parsing 取不到時是 None（**不是空字串** —— 「取不到」和「空的」
     必須分得出來，否則呼叫端會拿未知當成證據）。
     """
-    folder = bind_folder(abs_pidl)
-    for rel_pidl in _enum_pidls(folder, flags, batch):
+    if report is None:
+        report = EnumReport()
+
+    for folder, rel_pidl in _iter_pairs(abs_pidl, flags, batch,
+                                        verify_empty, report):
         try:
             name = folder.GetDisplayNameOf(rel_pidl, shellcon.SHGDN_NORMAL)
         except pythoncom.com_error:
@@ -244,7 +499,10 @@ def iter_entries(abs_pidl, flags=EVERYTHING, want_attributes=False,
         try:
             parsing = child_parsing_name(folder, rel_pidl)
         except Exception as exc:      # noqa: BLE001
-            log.debug("取不到「%s」的解析名稱：%s", name, exc)
+            # ★ 這裡以前是 log.debug，而 log level 是 INFO ——
+            #   等於「解析名稱讀不到」這件事在 log 裡完全看不見。
+            #   裝置判斷就是靠解析名稱，讀不到必須留下痕跡。
+            log.warning("取不到「%s」的解析名稱：%s", name, exc)
             parsing = None
         yield combine(abs_pidl, rel_pidl), name, attributes, parsing
 

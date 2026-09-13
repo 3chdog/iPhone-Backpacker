@@ -394,3 +394,143 @@ UI 顯示「備份已取消」，並說明**已完成的檔案會保留，下次
 真正擋人的是 SmartScreen（未簽章必跳）與防毒誤判。
 簽章憑證 OV 一年約台幣一萬且強制硬體金鑰/雲端 HSM，對免費工具不划算，
 改在 README 教使用者點「其他資訊 → 仍要執行」。
+
+---
+
+## D19 — 用 `IFileOperationProgressSink` 取得逐檔 HRESULT（**推翻 D6**）  ✅ 定案
+
+**背景**：D6 當時寫「pywin32 對 `IFileOperationProgressSink` 支援不完整，
+改用 `FOF_NOERRORUI` + 事後驗證掃描」。**那個前提經查證是錯的。**
+
+pywin32 不但支援，還自己附了範例
+（`com/win32comext/shell/demos/IFileOperationProgressSink.py`）：
+
+```python
+class FileOperationProgressSink(DesignatedWrapPolicy):
+    _com_interfaces_ = [shell.IID_IFileOperationProgressSink]
+    _public_methods_ = ["StartOperations", "FinishOperations", ...]
+pythoncom.WrapObject(FileOperationProgressSink(), shell.IID_IFileOperationProgressSink)
+```
+
+而 `PostCopyItem` 的簽章帶著**逐檔的 HRESULT**：
+
+```
+PostCopyItem(Flags, Item, DestinationFolder, NewName, hrCopy, NewlyCreated)
+                                             ^^^^^^^
+```
+
+`PyIFileOperation.Advise` / `Unadvise` 也都在。
+
+**代價是實打實的**：2026-08-30 民眾B 那次 3649 個檔案全數失敗，我們只知道
+「全部失敗」，一個錯誤碼都沒有，事後怎麼推都推不出根因。有了 sink，
+同樣的災情會留下 3649 個 HRESULT 的分布，一次就能定位。
+
+**決策**：`core/copysink.py` 掛上 sink，但**保留** `FOF_NOERRORUI` 與第 3 段
+驗證掃描 —— 兩者是**獨立的證據來源**：sink 說「Shell 認為這個檔案複製成功了」，
+驗證掃描說「檔案真的在目的地而且不是 0 byte」。**兩者不一致本身就是最有價值的訊息。**
+
+**三個地雷（外部實測來源，不要自己試）**：
+1. **`PreCopyItem` 一律回 `S_OK`。** 回 `S_FALSE` 會**中止整批操作**，
+   不是「跳過這一個」（xplorer² 實測）。
+2. **callback 裡絕不寫 log、絕不呼叫 COM。** 它每個檔案被呼叫一次；
+   3649 次 `log.warning` 是 3649 次磁碟寫入，而 `Item.GetDisplayName()`
+   在 MTP 上是一次來回（~3.4 ms），3649 次就是 12 秒純浪費。
+   名稱用 Shell 免費給的 `NewName`。
+3. **任何例外都不能逸出 callback** —— 它在 COM 的呼叫堆疊裡執行。
+
+**sink 是加分項，不是必需品**：建立失敗、`Advise` 失敗、pywin32 版本不合，
+一律降級成原本的驗證掃描，備份照跑。**診斷能力可以失去，備份能力不行。**
+
+---
+
+## D20 — 靜默 0 是 `IEnumIDList` 的語意上限，不是 bug  ✅ 定案
+
+**這一條是整個 v1.0.2 的核心認知。**
+
+`IEnumIDList` 在**語意上**就無法區分「列舉完了」與「provider 放棄了但選擇不報錯」：
+
+- 微軟文件（`IEnumIDList::Next`）：S_FALSE 且 `pceltFetched = 0`
+  就是「沒有更多項目」，**沒有第三種可能**。
+- Raymond Chen（2024-08-12）：`EnumObjects` 回 S_FALSE 時**允許**把
+  enumerator 設成 NULL。
+- pywin32 原始碼確認：`Next` 的檢查是
+  `if (HRESULT_CODE(hr) != ERROR_NO_MORE_ITEMS && FAILED(hr))` ——
+  S_FALSE 不拋例外，回傳長度 = `celtFetched` 的 list（可能是空的）。
+  `EnumObjects` 的 `IEnumIDList *ppeidl;` **宣告時未初始化**，
+  provider 回 S_FALSE 時 Python 端拿到 `None`。
+
+**所以「0 項」這個回答本身不帶任何可信度資訊，而且沒有 API 能補救。**
+
+**決策**：不改判斷規則（沒得改），改成**自己補三個獨立訊號**：
+
+1. **耗時** —— 8.8 秒的 0 和 20 毫秒的 0 是完全不同的兩件事
+2. **重驗** —— 重新 `BindToObject`、重新 `EnumObjects`，兩次都 0 才採信
+3. **旗標交叉** —— `只列檔案 + 只列資料夾` 應該等於 `全部`（診斷報告在做）
+
+**重驗策略刻意分兩路**（`verify_empty` 參數）：
+
+| 路徑 | 策略 | 理由 |
+|---|---|---|
+| 瀏覽（`list_subfolders`） | 只驗「慢速的 0」 | 344 個資料夾裡本來就有很多空的，每個都驗等於展開成本加倍，違反 D8 |
+| 複製（`iter_files`）、`is_empty` | **一律驗** | 這裡的假 0 = 整個資料夾沒備份到而且回報成功 |
+
+**連帶的兩條規則**：
+- 重試一律**丟掉 enumerator、重新 bind**。微軟文件對「`Next()` 回錯誤之後
+  enumerator 還能不能用」**完全沒有保證**；而且重新 bind 會重走
+  Desktop → 本機 → 裝置 這條路，那正是重建裝置連線的機會。
+- 重試的去重**用 PIDL，不靠順序**。Shell 不保證兩次列舉順序一致 ——
+  舊 CLI 版 `getFilteringSignals` 就是 zip 兩份獨立列舉而複製到錯的檔案。
+
+---
+
+## D21 — WPD 只當診斷探針，**不當資料路徑**  ✅ 定案
+
+**背景**：Shell 路徑（`IShellFolder`）把所有裝置狀態壓成同一個
+`0x8007001E`（ERROR_READ_FAULT，一個泛用的磁碟讀取錯誤）。於是
+「被其他程式佔用」「裝置當掉」「資料夾真的是空的」在原理上分不開。
+
+WPD 分得出來：
+
+| 常數 | 值 | 意義 |
+|---|---|---|
+| `E_WPD_DEVICE_ALREADY_OPENED` | `0x802A0001` | 已被其他程式開啟 |
+| `E_WPD_DEVICE_IS_HUNG` | `0x802A0006` | 裝置不再回應 |
+| `ERROR_BUSY` | `0x800700AA` | 忙碌中，**稍後重試會好** |
+| `ERROR_DEVICE_IN_USE` | `0x80070964` | 被其他程式佔用 |
+| `ERROR_DEVICE_NOT_CONNECTED` | `0x8007048F` | 已拔除 |
+
+而且 `IPortableDeviceManager.GetDevices()` 本身就是「iPhone 到底在不在」的
+**第二個獨立答案**，完全不經過 Shell 列舉。
+
+**評估過但否決的方案：雙路徑（Shell 為主、失敗時 fallback 到 WPD）。**
+否決的理由是**觸發條件定義不出來**：
+
+- 「手機沒解鎖／沒點信任」在 Shell 上的表現是「列舉成空的，不報錯」
+- 「裝置 session 壞掉」的表現**也是**空的或 `0x8007001E`
+- 「資料夾真的是空的」的表現**還是**空的
+
+這三者分不開正是我們想 fallback 的理由，於是觸發條件只能寫成
+「空的或出錯就 fallback」，而「空的」在正常使用中極為常見
+（344 個資料夾裡本來就有空的）→ **會被大量誤觸發。**
+
+而且 WPD 路徑不是「某支函式的備援」，是**列舉 + 複製 + 進度 + 取消**的
+平行實作：位置從 PIDL 變成 `(device_id, object_id)`、錯誤模型從
+`ShellError` 變成 `COMError.hresult`，最痛的是
+**`IFileOperation` 的原生進度視窗（D12 的全部價值）會歸零**，
+要自己開 stream、自己做 buffer 迴圈、自己畫進度、自己實作取消。
+**那不是維護成本翻倍，是把整個專案再做一次。**
+
+**決策**：`core/wpd_probe.py` 只做
+`GetDevices → 讀名稱 → Open → Close`，**不列舉內容、不搬任何資料**，
+結果只出現在診斷報告。
+
+- 所有 `import` 放在函式裡 —— 沒有 comtypes 的機器上模組本身也要 import 得起來
+- 每一步獨立 `try/except`，探針掛掉只會讓報告少一段
+- **開完一定要關** —— 這個探針絕不能變成「佔用裝置的那個程式」，
+  那正是我們在懷疑 CopyTrans 做的事
+- comtypes 會在 runtime 產生 wrapper（`comtypes/gen`），與 PyInstaller
+  有已知衝突 —— 這是接受風險而非忽視風險，圍堵方式見上
+
+**將來若真的要走雙路徑**，匯流點是 `listing.FileEntry` 與 `copier.run_copy`
+的**介面層**（把 `abs_pidl` 換成不透明的 `Location`、`run_copy` 抽成
+`CopyBackend`），**不要在列舉層匯流** —— 複製才是兩條路徑差異最大的地方。

@@ -645,3 +645,274 @@ UTF-8 的中文註解會變成亂碼。
   → GUI 路徑上不准有 `print` / `tqdm`，一律 `logging` 寫檔。
 - **`assert` 在 `-O` 模式會被整行移除** → 不要拿 `assert` 做執行期檢查。
 - manifest 用 `asInvoker`，**不要**要求管理員權限 —— 本程式不需要，多跳一個 UAC 只會更嚇人。
+
+---
+
+# 列舉的「0 項」在 API 層就無法判真假（2026-09-13 查證）
+
+**這是整個 v1.0.2 的核心認知，寫 code 之前一定要先懂這一段。**
+
+## 三份互相印證的證據
+
+**① 微軟文件 `IEnumIDList::Next`**
+
+> If this method returns a COM error code (as determined by the FAILED macro),
+> then **no entries in the rgelt array are valid on exit**.
+>
+> S_FALSE indicates that more items were requested than remained in the enumeration.
+> **Note that the value will be 0 if there are no more items to retrieve.**
+
+→ `S_FALSE` + `pceltFetched = 0` 就是「沒有更多項目」，**沒有第三種可能**。
+→ 而且錯誤發生時**整批都無效**，不是「前面幾筆還能用」。
+
+**② Raymond Chen, The Old New Thing（2024-08-12）**
+
+> `EnumObjects` has the rule that if it returns `S_FALSE`, then it is allowed to
+> return a null pointer instead of an enumerator.
+
+→ 拿到 `None` 是**合法且正常**的，意思是「沒有項目」。
+
+**③ pywin32 原始碼**（`com/win32comext/shell/src/`）
+
+`PyIEnumIDList::Next`：
+```c
+if (HRESULT_CODE(hr) != ERROR_NO_MORE_ITEMS && FAILED(hr)) { ...raise... }
+PyObject *result = PyList_New(celtFetched);
+```
+→ `S_FALSE` **不拋例外**，回傳長度 = `celtFetched` 的 list（可能是空的）。
+
+`PyIShellFolder::EnumObjects`：
+```c
+IEnumIDList *ppeidl;                       // ← 宣告時未初始化
+hr = pISF->EnumObjects(hwndOwner, grfFlags, &ppeidl);
+if (FAILED(hr)) return PyCom_BuildPyException(hr, pISF, IID_IShellFolder);
+return PyCom_PyObjectFromIUnknown(ppeidl, IID_IEnumIDList, FALSE);
+```
+→ `S_FALSE` 不是 `FAILED`，不拋例外。`ppeidl` **未初始化**，
+provider 回 S_FALSE 時 Python 端拿到 `None`。
+
+## 結論與對策
+
+**「0 項」這個回答本身不帶任何可信度資訊，而且沒有任何 API 能補救。**
+這不是我們的 bug，也不是 pywin32 的 bug —— 是 API 的解析度不夠。
+
+對策是自己補三個獨立訊號（見 D20）：耗時、重驗、旗標交叉比對。
+
+## 兩條連帶規則
+
+**故障後不要重用 enumerator。** 微軟文件對「`Next()` 回錯誤之後 enumerator
+還能不能用」**完全沒有保證**。舊版在同一個 enumerator 上重呼叫 `Next()`
+是沒有文件支持的行為。正解是丟掉它、**重新 `BindToObject` + `EnumObjects`**，
+而且重新 bind 會重走 Desktop → 本機 → 裝置 這條路，那正是重建裝置連線的機會。
+
+**重試的去重要用 PIDL，不能靠順序。** Shell 不保證兩次列舉的順序一致。
+（舊 CLI 版 `getFilteringSignals` 就是 zip 兩份獨立列舉而複製到錯的檔案。）
+
+## `EnumObjects(0, flags)` 的 hwnd 是 NULL
+
+微軟文件：`hwndOwner` 為 NULL 時，列舉器不應張貼任何訊息，
+**需要使用者輸入時應該靜默失敗**。我們目前確實傳 0 ——
+在「裝置已信任」的情境下沒有輸入需求，所以還沒觀察到影響，但這是已知的邊界。
+
+---
+
+# `IFileOperation` 的三個實測坑（2026-09-13）
+
+**① `PostCopyItem` 帶著逐檔 HRESULT，而 pywin32 完整支援 sink。**
+
+```
+PostCopyItem(Flags, Item, DestinationFolder, NewName, hrCopy, NewlyCreated)
+```
+
+pywin32 自己附了範例：`com/win32comext/shell/demos/IFileOperationProgressSink.py`，
+用 `DesignatedWrapPolicy` + `_com_interfaces_` + `pythoncom.WrapObject`，
+16 個 callback 全部可用，`PyIFileOperation.Advise` / `Unadvise` 也都在。
+**D6 當初寫「支援不完整」是沒查證就下的結論**，代價見 D19。
+
+**② 從 `PreCopyItem` 回 `S_FALSE` 會中止整批操作，不是跳過單一項目。**
+（xplorer² 實測。）想過濾檔案就在排程階段過濾，不要在 sink 裡擋。
+
+**③ callback 在跑 `PerformOperations()` 的那條執行緒上、每個檔案被呼叫一次。**
+裡面**絕不能寫 log、絕不能呼叫 COM**：3649 次 `log.warning` 是 3649 次磁碟寫入，
+而 `Item.GetDisplayName()` 在 MTP 上是一次來回（~3.4 ms），3649 次就是 12 秒純浪費。
+名稱用 Shell 免費給的 `NewName`。
+
+**另外**：微軟文件對 `GetAnyOperationsAborted` 的措辭是
+「operations can be stopped before they are complete either by user action
+**or silently by the system**」—— 後半句就是 8/30 那次 3649 全失敗的官方名稱。
+
+---
+
+# WPD 能分辨的裝置狀態（Shell 路徑全部壓成 `0x8007001E`）
+
+| 常數 | 值 | 意義 |
+|---|---|---|
+| `E_WPD_DEVICE_ALREADY_OPENED` | `0x802A0001` | 已被其他 client 開啟 |
+| `E_WPD_DEVICE_NOT_OPEN` | `0x802A0002` | 尚未開啟 |
+| `E_WPD_DEVICE_IS_HUNG` | `0x802A0006` | 裝置不再回應 |
+| `ERROR_BUSY` | `0x800700AA` | 正在處理別的操作，**稍後重試會好** |
+| `ERROR_DEVICE_IN_USE` | `0x80070964` | 被其他程式佔用 |
+| `ERROR_DEVICE_NOT_CONNECTED` | `0x8007048F` | 已拔除 |
+| `ERROR_GEN_FAILURE` / `ERROR_IO_DEVICE` / `ERROR_SEM_TIMEOUT` / `ERROR_TIMEOUT` | `0x8007001F` / `0x8007045D` / `0x80070079` / `0x800705B4` | 皆歸類為「裝置沒有回應」 |
+
+**而 Shell 路徑給我們的一律是 `0x8007001E`（ERROR_READ_FAULT）。**
+這就是為什麼「CopyTrans 佔用」「裝置當掉」「真的是空的」分不開 ——
+也是 `core/wpd_probe.py` 存在的唯一理由（D21）。
+
+`0x8007001E` 是 MTP 這條路的**通病，不是 iPhone 專屬**：calibre 的 MTP Windows
+程式碼有一模一樣的錯誤字串
+（`Failed to EnumObjects() of folder from device: [hr=0x8007001e]`），
+而且它對 iPhone 根本不走 MTP（走 libimobiledevice），樣本是 Android 與電子書閱讀器。
+
+---
+
+# iPhone 的傳輸模式無法只靠副檔名判斷（2026-09-13）
+
+常見說法是「看到 `.heic` 就是保留原始檔」。**那是錯的。**
+
+「自動」模式**只有在 iOS 認為這台 PC 讀不懂 HEIC 時**才會即時轉檔。
+若電腦上裝了 HEIC 解碼器（CopyTrans HEIC、微軟的 HEIF 影像擴充功能…），
+iOS 可能判定「這台讀得懂」而直接給 HEIC —— 即使使用者選的是「自動」。
+
+→ 診斷報告的「傳輸模式判定」段輸出的是**證據 + 傾向**，不是結論。
+→ 要確定還是得問使用者本人（民眾B 2026-09-13 回信：**保留原始檔**）。
+
+---
+
+# 裝置壞掉之後，同一個 process 內不會自己恢復（2026-09-12 實測時間軸）
+
+| 時刻 | 事件 |
+|---|---|
+| 16:16:02 | 啟動 #2，偵測正常，樹狀展開拿到 344 個資料夾 |
+| 16:16:50 | `200807__` 0 個檔案（**9 ms**）、`201301__` 0 個檔案（**42.3 秒**） |
+| 16:49:11 | **同一個 process**，probe 拿到 `0x8007001E`（壞了 32 分鐘還沒好） |
+| 16:50:47 | 關閉程式 |
+| 16:58:38 | 啟動 #3 |
+| 16:59:34 | **同樣那兩個資料夾**：12 個、1 個檔案，複製成功 |
+
+**32 分鐘沒自癒，關掉重開 8 分鐘後正常 → 時間解釋不了，process 邊界可以。**
+
+08-30 那次也一樣：3649 全失敗之後，兩輪重試共 26 次列舉**每次都花 8.73~8.83 秒
+回傳 0 項**（離散度小到只可能是固定逾時），直到關掉程式為止都沒恢復。
+
+→ 這是「重新整理裝置」被改成**重建 worker 執行緒與 COM apartment** 的理由。
+→ 還沒查到 WPD namespace provider 的 session 生命週期文件，
+  所以這是**假設不是結論**，等民眾B 驗證。
+→ 已知相關：重啟 Apple Mobile Device Service 會強制 Windows 重新列舉 iPhone
+  並清掉卡住的 handle（來源品質一般，但與觀察一致）。
+
+---
+
+# comtypes + PyInstaller
+
+comtypes 在 **runtime** 產生 COM wrapper 到 `comtypes/gen`，
+與 PyInstaller 的凍結環境有已知衝突（`FileNotFoundError(gen_dir)` 等）。
+
+→ `core/wpd_probe.py` 的每一個 `import` 都放在函式裡、每一步獨立 `try/except`，
+  探針掛掉只會讓診斷報告少一段，**不影響任何其他功能**。
+→ 這是**接受風險**而非忽視風險。若打包後探針一直不能用，
+  退路是改用 ctypes 手刻 vtable 呼叫（只有 5 個呼叫，工作量可控）。
+
+---
+
+# WPD 探針的實測結果（2026-09-14，rc.2 真機）
+
+## 探針可用，而且 `Open()` 的答案就是我們要的
+
+實測輸出（開發者自己的機器，Win10 1607）：
+
+```
+WPD 探針：看到 3 台裝置
+    \\?\swd#wpdbusenum#_??_usbstor#disk&ven_&prod_usb_disk_2.0&...   open=成功
+    \\?\usb#vid_05ac&pid_12a8#0000802000117ce43684002e#{6ac27878-...}  open=成功
+    \\?\swd#wpdbusenum#_??_usbstor#disk&ven_multiple&prod_card_reader&...  open=成功
+```
+
+## ★ `GetDevices()` 不是只回 MTP 裝置
+
+三台裡面只有一台是 iPhone，另外兩台是**隨身碟與讀卡機** ——
+Windows 的 WPD FileSystem Volume Driver 會把卸除式磁碟區也註冊成 WPD 裝置。
+所以「WPD 看到 N 台」這個數字**不能**直接當成「有 N 台手機」。
+
+## ★★ WPD 的裝置 ID 會原封不動出現在 Shell 的解析名稱裡
+
+```
+Shell : ::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\<以下這一段>
+WPD   : \\?\usb#vid_05ac&pid_12a8#0000802000117ce43684002e#{6ac27878-a6fa-4155-ba85-f98f491d4f33}
+```
+
+**所以直接做字串包含檢查就能回答「這兩條獨立的路看到的是不是同一台」。**
+不需要比對任何顯示名稱、也不需要寫死 vid/pid（守住 D5）。
+診斷報告第六段就是這樣交叉比對的。
+
+## `GetDeviceFriendlyName` 取不到名稱 —— **刻意不修**
+
+實測三台的名稱、製造商、描述**全是空的**，而錯誤是在**第一段**就發生：
+
+```
+GetDeviceFriendlyName：問長度就失敗：'NoneType' object cannot be interpreted as an integer
+```
+
+這是 Python 層的錯誤，不是 COM 錯誤。IDL 上這個方法是
+
+```
+HRESULT GetDeviceFriendlyName(
+    [in] LPCWSTR pszPnPDeviceID,
+    [in, out, unique, size_is(*pcchDeviceFriendlyName)] WCHAR *pDeviceFriendlyName,
+    [in, out] DWORD *pcchDeviceFriendlyName);
+```
+
+`size_is(*pcchDeviceFriendlyName)` 讓 comtypes 想用第三個參數去決定陣列長度，
+而我們第一段傳的第二個參數是 `None` —— 推測是這裡對不上。
+
+**結論：不修。** 理由：
+
+1. **裝置 ID 比名稱可靠得多** —— 裡面有 vid/pid 與序號，而且
+   名稱是使用者可以改的（改了就會違反 D5 的精神）。
+2. **交叉比對已經解決辨識問題** —— 報告會直接寫「★ 就是上面的
+   「Apple iPhone」」，名稱一點忙都幫不上。
+3. 開發機是 Linux，每一次嘗試都要 Jack 在 Windows 上重跑一輪 build +
+   測試。為了一個沒有價值的欄位燒掉好幾輪，不划算。
+
+報告現在把這個錯誤集中在該段最後講一次，並明說「**這不是問題**」。
+
+**教訓**：`_string_property` 原本把失敗吞進 `log.debug`，
+於是報告只印「（取不到）」卻不說為什麼 —— 等於白跑一輪。
+**取不到的原因本身就是要回報的資訊**，而且要印在人看得到的地方。
+
+---
+
+# comtypes 在凍結環境下會自己找到可寫的路（2026-09-14 實測）
+
+```
+Could not import comtypes.gen, trying to create it.
+Creating comtypes.gen package failed: [WinError 3] ..._internal\comtypes\gen
+Created a memory-only package.
+Using writeable comtypes cache directory: ...\Temp\comtypes_cache\iPhoneBackpacker-312
+# Generating comtypes.gen.PortableDeviceApiLib
+# Generating comtypes.gen.PortableDeviceTypesLib
+```
+
+`_internal\comtypes\gen` 不可寫時，comtypes 會自動退到
+`%TEMP%\comtypes_cache\<exe 名>-<python 版本>`，然後**成功**產生 wrapper。
+所以打包時**不需要**預先產生型別庫，只要把子模組收齊就好。
+
+## `collect_submodules("comtypes")` 要過濾掉 `comtypes.test`
+
+整包收會連 comtypes 自己的測試套件（約 60 個模組）一起拉進來，
+而 `comtypes.test.setup` 會再把 distutils / setuptools / pkg_resources
+整串帶進來。實測體積 **114 MB → 117 MB**、分析時間也明顯變長。
+測試套件對使用者零用處，多帶的東西只會增加防毒誤判的面積。
+
+---
+
+# `IFileOperationProgressSink` 已在真機驗證（2026-09-14）
+
+```
+逐檔回報已接上（IFileOperationProgressSink）
+收到 47 次逐檔回報：成功 47、失敗 0
+    0x00000000（S_OK 成功） × 47
+    FinishOperations：0x00000000（S_OK 成功）
+```
+
+第二輪 105 個檔案、4 個資料夾也一樣正常。**D19 成立，D6 正式作廢。**

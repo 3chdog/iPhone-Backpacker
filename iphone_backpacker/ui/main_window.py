@@ -73,6 +73,9 @@ class MainWindow(QMainWindow):
     request_copy = Signal(object, str, object, int)
     request_clear_cache = Signal()
     request_report = Signal(object)
+    #: ★ 要求整個重建 worker 執行緒（連帶取得全新的 COM apartment）。
+    #:   由 app.py 接。見 _on_refresh 的說明。
+    request_restart_worker = Signal()
 
     def __init__(self):
         super().__init__()
@@ -435,7 +438,31 @@ class MainWindow(QMainWindow):
             lines.append("")
             lines.append("⚠ 來源資料夾裡一個符合條件的檔案都讀不到。")
             lines.append("如果你確定裡面有照片，這通常代表裝置連線出了問題。")
-            lines.append("請把 USB 線拔掉重插，等手機準備好之後再試一次。")
+            lines.append("請按「重新整理裝置」，或把 USB 線拔掉重插再試一次。")
+        if report.unreadable:
+            # ★ 這幾個資料夾**沒有備份到**，而且原因是讀不到，不是沒東西。
+            #   絕不能讓它們混在「備份完成」裡被無聲帶過。
+            lines.append("")
+            lines.append("⚠ 有 {} 個資料夾整個讀不到，**沒有備份到**：".format(
+                len(report.unreadable)))
+            lines.extend("  {}（{}）".format(n, m)
+                         for n, m in report.unreadable[:10])
+            if len(report.unreadable) > 10:
+                lines.append("  …（完整清單在 log 檔裡）")
+            lines.append("請按「重新整理裝置」之後再備份一次。")
+        if report.suspicious_empty:
+            lines.append("")
+            lines.append("⚠ 有 {} 個資料夾回報「0 個檔案」，但那個 0 不可信"
+                         "（讀太久或兩次結果不一致）：".format(
+                             len(report.suspicious_empty)))
+            lines.extend("  " + n for n in report.suspicious_empty[:10])
+            if len(report.suspicious_empty) > 10:
+                lines.append("  …（完整清單在 log 檔裡）")
+            lines.append("這些**不算備份完成**。請按「重新整理裝置」之後再試一次。")
+        if report.zero_byte:
+            lines.append("")
+            lines.append("⚠ 有 {} 個檔案複製過去之後是空的（0 bytes）。"
+                         "下次備份會自動重新複製它們。".format(len(report.zero_byte)))
         if not report.copied and report.failed and not report.aborted:
             lines.append("")
             lines.append("⚠ 一個檔案都沒有成功，這通常代表複製到一半"
@@ -473,7 +500,8 @@ class MainWindow(QMainWindow):
         # 「重試」不需要特別的機制 —— 增量去重會自動跳過已經複製好的，
         # 所以重跑同一個任務就等於只重試沒完成的那些。
         retry_button = None
-        if (report.failed or report.cancelled) and self._last_job is not None:
+        if (report.failed or report.cancelled or report.unreadable
+                or report.suspicious_empty) and self._last_job is not None:
             retry_button = box.addButton("重試未完成的項目",
                                          QMessageBox.ButtonRole.AcceptRole)
         box.addButton("關閉", QMessageBox.ButtonRole.RejectRole)
@@ -493,15 +521,29 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_refresh(self):
-        """重新整理裝置。
+        """重新整理裝置 —— **會整個重建背景執行緒與 COM apartment**。
 
-        MTP 偶爾會回傳不完整的清單（Windows 已知毛病），重列一次通常就好。
-        真的還是不對就請使用者重新插拔 USB。
+        ★★ 為什麼做得這麼重（2026-09-13，民眾B 案）：
+
+          實測時間軸顯示，裝置連線一旦進入壞狀態，**同一個 process 內
+          不會自己恢復**：16:16:50 壞掉 → 16:49 還是壞的（32 分鐘）→
+          關掉程式 → 8 分鐘後重開，同樣兩個資料夾立刻正常。
+          時間解釋不了，process 邊界可以。
+
+          重啟程式相對於原本的 process，最明顯的差別就是拿到一個
+          **全新的 COM apartment**。所以這個按鈕現在做的就是「不用關程式的重啟」：
+          結束舊執行緒（CoUninitialize）→ 建新的（CoInitialize）→ 重新偵測。
+
+          如果這樣就能救回來，使用者不必再關掉程式重開；
+          如果救不回來，那也是很有價值的資訊 —— 代表壞掉的狀態比 apartment 更深。
         """
         self._file_counts.clear()
-        self.request_clear_cache.emit()
-        self.banner.setText("正在偵測裝置…")
+        self.banner.setText("正在重新連接裝置…")
         self.tree.clear()
+        self.statusBar().showMessage("正在重新連接裝置…")
+        # ★ 順序很重要：先重建，之後的請求才會送到新的 worker 身上。
+        #   （這是 direct connection，emit 當下就同步做完。）
+        self.request_restart_worker.emit()
         self.request_detect.emit()
         self.request_roots.emit()
 
@@ -555,8 +597,24 @@ class MainWindow(QMainWindow):
             [i.data(0, PIDL_ROLE) for i in targets], self._categories)
 
     def _on_build_report(self):
-        current = self.tree.currentItem()
-        focus = current.data(0, ENTRY_ROLE) if current is not None else None
+        """★ 挑檢查目標的規則（2026-09-13 修）：
+
+        1. 使用者勾選的第一個資料夾 —— 那才是他想查的東西
+        2. 沒有勾選，就用游標所在的節點，但**只在它不是最上層節點時**
+        3. 都沒有 → 交給 core 自己挑裝置上最新的那個資料夾
+
+        第 2 點的限制是關鍵：最上層是「本機」的直接子項，排序後
+        "3d objects" 的 '3' 排在所有字母前面，所以游標的預設位置幾乎
+        一定落在它身上。而 Windows 10 21H2 之後 3D Objects 的實體資料夾
+        常常不存在，檢查必定失敗，報告就印出「顯示 0 個檔案很可能是
+        讀取問題」—— 拿一個必然失敗的目標當健康度指標，還嚇使用者一跳。
+        """
+        checked = self._checked_entries()
+        focus = checked[0] if checked else None
+        if focus is None:
+            current = self.tree.currentItem()
+            if current is not None and current.parent() is not None:
+                focus = current.data(0, ENTRY_ROLE)
         self.btn_report.setEnabled(False)
         self.btn_report.setText("產生中…")
         self.statusBar().showMessage("正在收集診斷資料…")

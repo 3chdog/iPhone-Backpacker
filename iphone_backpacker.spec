@@ -66,6 +66,41 @@ EXCLUDES = [
 # 它們體積不大，卻常被其他套件間接 import，排掉的風險遠大於收益。
 # 真的很在意體積再回頭試，一次加一個並實測。
 
+# ★★ comtypes 要**整包**收進來（2026-09-14 實測修正）。
+#
+#   comtypes 是在 **runtime** 才產生 WPD 的 COM wrapper，而那份產生出來的
+#   模組會 import comtypes 的其他子模組。程式碼裡沒有任何靜態 import 指向
+#   它們，PyInstaller 的分析當然找不到。
+#
+#   實測（打包後執行）：
+#       Creating comtypes.gen package failed: [WinError 3] ..._internal\comtypes\gen
+#       Created a memory-only package.
+#       Using writeable comtypes cache directory: ...\Temp\comtypes_cache\...
+#       WPD 探針不可用：載入 WPD 型別庫失敗（No module named 'comtypes.stream'）
+#
+#   —— 前面幾步都成功了（它會自己退到可寫的暫存目錄），只差 `comtypes.stream`
+#   這種沒被收進來的子模組。所以不要一個一個列，整包收。
+#
+#   ★ 這是**選配**的：comtypes 沒裝就收不到東西，打包照樣完成，
+#     只是診斷報告會少「WPD 探針」那一段。絕不能讓它擋住打包。
+#   ★ 但要把 `comtypes.test` 擋掉（2026-09-14 實測修正）。整包收會連
+#     comtypes 自己的測試套件（~60 個模組）一起拉進來，而 `comtypes.test.setup`
+#     會再把 distutils / setuptools / pkg_resources 整串帶進來 ——
+#     實測體積 114 MB → 117 MB、分析時間也明顯變長。
+#     測試套件對使用者一點用都沒有，而且多帶的東西只會增加防毒誤判的面積。
+COMTYPES_SKIP = ("comtypes.test",)
+
+try:
+    from PyInstaller.utils.hooks import collect_submodules
+    COMTYPES_MODULES = [
+        name for name in collect_submodules("comtypes")
+        if not any(name == skip or name.startswith(skip + ".")
+                   for skip in COMTYPES_SKIP)
+    ]
+except Exception as exc:      # noqa: BLE001
+    print("（沒有收到 comtypes，WPD 探針將不可用：{}）".format(exc))
+    COMTYPES_MODULES = []
+
 a = Analysis(
     ["run_gui.py"],
     pathex=[],
@@ -75,9 +110,14 @@ a = Analysis(
         # pywin32 的 shell 擴充是動態載入的，PyInstaller 不一定找得到
         "win32com.shell.shell",
         "win32com.shell.shellcon",
+        "win32com.server.policy",   # IFileOperationProgressSink 的 gateway（D19）
         "pythoncom",
         "pywintypes",
-    ],
+        # ★ 選配：WPD 診斷探針（D21）。詳見上面的 COMTYPES_MODULES。
+        #   core/wpd_probe.py 的每一個 import 都在函式裡、每一步獨立
+        #   try/except，所以**就算這裡收不齊也只是診斷報告少一段**，
+        #   絕不會影響備份。
+    ] + COMTYPES_MODULES,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

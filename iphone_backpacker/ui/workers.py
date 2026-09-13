@@ -91,9 +91,38 @@ class ShellWorker(QObject):
             detection = device.detect()
         except BackpackerError as exc:
             log.exception("裝置偵測失敗")
-            detection = device.Detection(device.DeviceStatus.NOT_FOUND)
-            log.error("%s", exc)
+            detection = self._detection_after_failure(exc)
         self.device_detected.emit(detection)
+
+    @staticmethod
+    def _detection_after_failure(exc):
+        """偵測炸掉之後，盡量別給出誤導的結論。
+
+        ★ 舊版一律回 NOT_FOUND，於是畫面顯示「沒有自動偵測到 iPhone，
+          請確認 USB 線接好了、手機已解鎖」—— 但 2026-09-12 16:49 那次
+          明明**已經找到 iPhone 而且確認了 WPD 證據**，只是 probe 拿到
+          0x8007001E。把使用者推去檢查早就沒問題的線材和解鎖狀態，
+          比什麼都不說還糟。
+
+          所以這裡再試一次「只列候選、不 probe」：列得出來就是 READ_FAILED
+          （找到了但讀不到），真的列不出來才是 NOT_FOUND。
+        """
+        log.error("%s", exc)
+        try:
+            candidates = tuple(device.find_portable_devices())
+        except BackpackerError as inner:
+            log.warning("連候選清單都列不出來：%s", inner)
+            return device.Detection(device.DeviceStatus.NOT_FOUND)
+
+        if not candidates:
+            return device.Detection(device.DeviceStatus.NOT_FOUND)
+
+        confirmed = [d for d in candidates
+                     if d.confidence is device.Confidence.CONFIRMED]
+        # 只有在「剛好一台確定是可攜式裝置」時才敢指名道姓（決策 D17）。
+        named = confirmed[0] if len(confirmed) == 1 else None
+        log.warning("裝置在（%d 個候選），但讀不到內容", len(candidates))
+        return device.Detection(device.DeviceStatus.READ_FAILED, named, candidates)
 
     @Slot()
     def load_roots(self):
