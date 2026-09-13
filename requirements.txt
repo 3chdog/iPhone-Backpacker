@@ -7,3 +7,9 @@
 
 pywin32==306
 PySide6==6.7.3
+
+# 選配：WPD 診斷探針用（core/wpd_probe.py，決策 D21）。
+# ★ 沒裝也完全不影響備份功能 —— 診斷報告只會少「WPD 探針」那一段。
+#   它在 runtime 產生 COM wrapper，與 PyInstaller 有已知衝突，
+#   所以程式裡每一步都獨立 try/except，探針掛掉不會影響任何其他功能。
+comtypes==1.4.6
