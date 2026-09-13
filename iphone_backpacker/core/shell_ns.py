@@ -216,12 +216,19 @@ class EnumReport:
     null_enumerator: bool = False
     errors: List[str] = field(default_factory=list)
 
-    #: 這次列舉的結果能不能拿來當「這裡沒有東西」的證據。
-    #: ★ 只有 OK / RECOVERED / EMPTY_VERIFIED / EMPTY（快速）算數。
     @property
     def trustworthy(self):
-        return self.status in (EnumStatus.OK, EnumStatus.RECOVERED,
-                               EnumStatus.EMPTY, EnumStatus.EMPTY_VERIFIED)
+        """這份清單能不能當成事實看待（例如：可不可以進快取）。
+
+        ★ `EMPTY_WAS_WRONG` 即使最後拿到了東西也算不可信 ——
+          這個 provider 剛剛才示範過它會謊報 0，沒有理由相信
+          它第二次給的清單就是完整的。寧可下次重列一遍。
+        """
+        if self.status in (EnumStatus.FAILED, EnumStatus.EMPTY_WAS_WRONG):
+            return False
+        if self.count:
+            return True
+        return not self.suspicious_zero
 
     @property
     def suspicious_zero(self):

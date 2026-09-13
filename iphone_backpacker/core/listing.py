@@ -104,9 +104,10 @@ def list_subfolders(abs_pidl, cache=None, report=None):
     ]
     entries.sort(key=lambda e: e.key)
 
-    # ★ 可疑的 0 不進快取 —— 否則使用者按「重新整理」之前都會一直看到
-    #   那個假的空清單，而快取的存活範圍是一整個 session。
-    if cache is not None and not report.suspicious_zero:
+    # ★ 不可信的清單不進快取 —— 否則使用者按「重新整理」之前都會一直看到
+    #   那份假清單，而快取的存活範圍是一整個 session。
+    #   「可疑的 0」與「騙過我們一次之後才給的清單」兩種都不收。
+    if cache is not None and report.trustworthy:
         cache.put_subfolders(abs_pidl, entries)
     return entries
 
