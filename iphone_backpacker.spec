@@ -83,9 +83,20 @@ EXCLUDES = [
 #
 #   ★ 這是**選配**的：comtypes 沒裝就收不到東西，打包照樣完成，
 #     只是診斷報告會少「WPD 探針」那一段。絕不能讓它擋住打包。
+#   ★ 但要把 `comtypes.test` 擋掉（2026-09-14 實測修正）。整包收會連
+#     comtypes 自己的測試套件（~60 個模組）一起拉進來，而 `comtypes.test.setup`
+#     會再把 distutils / setuptools / pkg_resources 整串帶進來 ——
+#     實測體積 114 MB → 117 MB、分析時間也明顯變長。
+#     測試套件對使用者一點用都沒有，而且多帶的東西只會增加防毒誤判的面積。
+COMTYPES_SKIP = ("comtypes.test",)
+
 try:
     from PyInstaller.utils.hooks import collect_submodules
-    COMTYPES_MODULES = collect_submodules("comtypes")
+    COMTYPES_MODULES = [
+        name for name in collect_submodules("comtypes")
+        if not any(name == skip or name.startswith(skip + ".")
+                   for skip in COMTYPES_SKIP)
+    ]
 except Exception as exc:      # noqa: BLE001
     print("（沒有收到 comtypes，WPD 探針將不可用：{}）".format(exc))
     COMTYPES_MODULES = []

@@ -280,6 +280,25 @@ def _is_local_path_folder(folder):
     return shell_ns.looks_like_filesystem_path(parsing or "")
 
 
+def _explain_filtered_zero(report, label, items, enum_report, other_kind, others):
+    """「只列 X 是 0、而且慢」到底該不該緊張。
+
+    有另一種項目在，那個慢就被解釋掉了（事後過濾，見 D10），不要嚇使用者；
+    兩種都沒有才是真的可疑。
+    """
+    if items or not enum_report.suspicious_zero:
+        return
+    if others:
+        report.say("「{}」是 0 項而且花了一段時間，但**這是正常的**：".format(label))
+        report.say("　這個資料夾底下有 {} 個{}，而 Windows 的「{}」是事後過濾 ——"
+                   .format(len(others), other_kind, label))
+        report.say("　它會先把 {} 項全部讀出來再濾掉，所以慢是必然的，"
+                   "不代表讀取有問題。".format(len(others)))
+    else:
+        report.say("!! 「{}」的 0 不可信 —— 見上面的耗時與嘗試次數。".format(label))
+    report.say()
+
+
 def _describe_one_folder(report, folder):
     """某個資料夾到底有沒有東西。用三種旗標交叉比對。"""
     report.say("這一段用來回答：某個資料夾顯示 0 個檔案，是真的空的還是沒讀到。")
@@ -329,22 +348,17 @@ def _describe_one_folder(report, folder):
         report.say("!! 有列舉失敗 —— 顯示 0 個檔案很可能是讀取問題，不是真的空的。")
         return
 
-    # ★★ 「只列檔案 0 項而且很慢」不一定可疑（2026-09-14 實測修正）。
-    #   實測 [Internal Storage]：只列檔案 0 項花了 1542 ms，被標成「不可信」——
-    #   但那是**假警報**。它底下有 181 個子資料夾，而 SHCONTF_NONFOLDERS
-    #   是**事後過濾**（見 D10）：provider 會先把 181 項全部實體化再濾掉，
-    #   所以慢是必然的，跟連線狀態無關。
-    #   有子資料夾就是對這個慢最好的解釋，不要再嚇使用者。
-    if not files and folders and files_report.suspicious_zero:
-        report.say("「只列檔案」是 0 項而且花了一段時間，但**這是正常的**：")
-        report.say("　這個資料夾底下有 {} 個子資料夾，而 Windows 的"
-                   "「只列檔案」是事後過濾 ——".format(len(folders)))
-        report.say("　它會先把 {} 項全部讀出來再濾掉，所以慢是必然的，"
-                   "不代表讀取有問題。".format(len(folders)))
-        report.say()
-    elif not files and files_report.suspicious_zero:
-        report.say("!! 「只列檔案」的 0 不可信 —— 見上面的耗時與嘗試次數。")
-        report.say()
+    # ★★ 「X 是 0 而且很慢」不一定可疑，而且這件事**兩個方向都成立**
+    #   （2026-09-14 實測修正）。
+    #   `SHCONTF_FOLDERS` 與 `SHCONTF_NONFOLDERS` 都是**事後過濾**（見 D10）：
+    #   provider 會先把整層全部實體化再濾掉不要的。所以
+    #     「只列檔案 0 項」  在有 181 個子資料夾的節點上必然慢（實測 1542 ms）
+    #     「只列資料夾 0 項」在有幾千個檔案的節點上一樣必然慢
+    #   兩邊都要解釋，只修一邊的話假警報只是換另一邊出現。
+    _explain_filtered_zero(report, "只列檔案", files, files_report,
+                           "子資料夾", folders)
+    _explain_filtered_zero(report, "只列資料夾", folders, folders_report,
+                           "檔案", files)
 
     if len(files) + len(folders) != len(everything):
         report.say("!! 數字對不起來：{} + {} != {}".format(
@@ -476,7 +490,7 @@ def _describe_transfer_mode(report, detection):
         report.say(">> 無法判斷：樣本裡既沒有 HEIC 也沒有 JPEG。")
 
 
-def _describe_wpd(report):
+def _describe_wpd(report, candidates=()):
     """WPD 探針 —— Shell 路徑分不出來的裝置狀態，這裡問得到（決策 D21）。
 
     ★ 這一段失敗完全不影響程式，它只是報告的一段。
@@ -500,13 +514,38 @@ def _describe_wpd(report):
         report.say("如果上面看得到 iPhone 而這裡看不到，請務必回報。")
         return
 
-    report.say("WPD 看到 {} 台裝置："
-               "（這是獨立於 Shell 列舉的第二個答案）".format(len(result.devices)))
+    # ★ 交叉比對（2026-09-14 新增）。這是這一段真正的價值所在：
+    #   WPD 的裝置 ID 會原封不動出現在 Shell 的解析名稱裡，例如
+    #     Shell : ::{20D04FE0-...}\\?\usb#vid_05ac&pid_12a8#<序號>#{6ac27878-...}
+    #     WPD   :                 \\?\usb#vid_05ac&pid_12a8#<序號>#{6ac27878-...}
+    #   所以直接做字串包含檢查就能回答「這兩條路看到的是不是同一台」——
+    #   不需要比對任何顯示名稱，也不需要寫死 vid/pid（D5）。
+    shell_ids = [(c.name, (c.parsing_name or "").lower()) for c in candidates]
+
+    report.say("WPD 看到 {} 台裝置"
+               "（這是獨立於 Shell 列舉的第二個答案）：".format(len(result.devices)))
+    matched_any = False
     for entry in result.devices:
         report.say()
         report.say("  {}".format(entry.friendly_name or "（沒有名稱）"))
-        report.say("      製造商    = {}".format(entry.manufacturer or "（取不到）"))
-        report.say("      描述      = {}".format(entry.description or "（取不到）"))
+        # ★ 裝置 ID 一定要印出來。名稱取不到時它就是唯一的辨識依據，
+        #   而且它裡面帶著 vid/pid 與序號，比名稱還可靠。
+        report.say("      裝置 ID   = {}".format(entry.device_id or "（取不到）"))
+        if entry.manufacturer or entry.description:
+            report.say("      製造商    = {}".format(entry.manufacturer or "（取不到）"))
+            report.say("      描述      = {}".format(entry.description or "（取不到）"))
+        if entry.name_error:
+            report.say("      名稱取不到的原因 = {}".format(entry.name_error))
+
+        hits = [name for name, parsing in shell_ids
+                if entry.device_id and entry.device_id.lower() in parsing]
+        if hits:
+            matched_any = True
+            report.say("      對照 Shell = ★ 就是上面的「{}」".format("、".join(hits)))
+        elif shell_ids:
+            report.say("      對照 Shell = 不是上面任何一個候選"
+                       "（多半是隨身碟或讀卡機，正常）")
+
         if entry.opened:
             report.say("      連線測試  = ★ 可以開啟 —— **裝置本身是好的**")
         else:
@@ -518,6 +557,14 @@ def _describe_wpd(report):
                        "「被其他程式佔用」「裝置當掉」「已拔除」")
             report.say("        在 Shell 那邊全都長成同一個 "
                        "0x8007001E，只有這裡分得出來。")
+
+    report.say()
+    if shell_ids and not matched_any:
+        report.say("!! WPD 看到的裝置**沒有一台**對得上 Shell 的候選清單。")
+        report.say("!! 兩條路看到的東西不一致，這件事本身就是重要線索，請務必回報。")
+    elif not shell_ids:
+        report.say("（Shell 那邊一個候選裝置都沒有，所以沒得對照。"
+                   "若 WPD 這裡看得到你的手機，請務必回報。）")
 
 
 def _describe_log_tail(report):
@@ -596,7 +643,8 @@ def collect_report(focus_folder=None, progress=None):
 
     report.section("五、傳輸模式判定",
                    lambda: _describe_transfer_mode(report, detection))
-    report.section("六、WPD 探針（裝置狀態）", lambda: _describe_wpd(report))
+    report.section("六、WPD 探針（裝置狀態）",
+                   lambda: _describe_wpd(report, candidates))
     report.section("七、紀錄檔內容", lambda: _describe_log_tail(report))
 
     report.title("報告結束")

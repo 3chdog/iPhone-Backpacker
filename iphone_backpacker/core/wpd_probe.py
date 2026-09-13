@@ -52,6 +52,11 @@ class WpdDevice:
     #: Open() 的結果。None = 沒試成、0 = 成功、其他 = HRESULT。
     open_hresult: Optional[int] = None
     open_error: str = ""
+    #: 名稱取不到時的原因。
+    #: ★ 實測（2026-09-14）三台裝置的名稱全部是空的，而失敗原因被
+    #:   `log.debug` 吞掉 —— 報告只印「（取不到）」卻不說為什麼，
+    #:   等於白跑一輪。失敗原因本身就是要回報的資訊。
+    name_error: str = ""
 
     @property
     def opened(self):
@@ -97,16 +102,41 @@ def _device_ids(manager):
 
 
 def _string_property(getter, device_id):
-    """同樣的兩段式呼叫，用來取名稱那幾個字串屬性。"""
-    from ctypes import c_ulong, create_unicode_buffer, pointer, wstring_at  # noqa: PLC0415, E501
+    """同樣的兩段式呼叫，用來取名稱那幾個字串屬性。
 
-    length = pointer(c_ulong(0))
-    getter(device_id, None, length)
-    if not length.contents.value:
-        return ""
-    buffer = create_unicode_buffer(length.contents.value)
-    getter(device_id, buffer, length)
-    return wstring_at(buffer)
+    回傳 `(內容, 失敗原因)`。**失敗原因一定要帶出去**（見 `WpdDevice.name_error`）。
+
+    ★ 第二段有兩種寫法都試（2026-09-14）：comtypes 產生的簽章要的是
+      `WCHAR*`，有些版本吃得下 `create_unicode_buffer()` 的 `c_wchar` 陣列，
+      有些會被型別檢查擋掉。我在 Linux 上驗不了是哪一種，所以兩種都試，
+      而且把每一種的失敗原因都記下來 —— 不要用猜的。
+    """
+    from ctypes import (POINTER, c_ulong, c_ushort, cast,      # noqa: PLC0415
+                        create_unicode_buffer, pointer, wstring_at)
+
+    try:
+        length = pointer(c_ulong(0))
+        getter(device_id, None, length)
+        size = length.contents.value
+    except Exception as exc:      # noqa: BLE001
+        return "", "問長度就失敗：{}".format(exc)
+    if not size:
+        return "", "回報的長度是 0"
+
+    buffer = create_unicode_buffer(size)
+    attempts = []
+    for label, argument in (("直接傳 buffer", buffer),
+                            ("轉成 WCHAR*", cast(buffer, POINTER(c_ushort)))):
+        try:
+            getter(device_id, argument, length)
+        except Exception as exc:  # noqa: BLE001
+            attempts.append("{}→{}".format(label, exc))
+            continue
+        text = wstring_at(buffer)
+        if text:
+            return text, ""
+        attempts.append("{}→呼叫成功但內容是空的".format(label))
+    return "", "；".join(attempts)
 
 
 def probe():
@@ -154,14 +184,21 @@ def probe():
     for device_id in ids:
         entry = WpdDevice(device_id=device_id)
         # 名稱三個屬性各自獨立 —— 任何一個取不到都不該讓整台裝置消失。
+        # ★ 裝置 ID 本身就足以辨識（裡面有 vid/pid 與序號），所以名稱取不到
+        #   不是災難；但**為什麼取不到**要留下來。
         for attr, getter_name in (("friendly_name", "GetDeviceFriendlyName"),
                                   ("manufacturer", "GetDeviceManufacturer"),
                                   ("description", "GetDeviceDescription")):
             try:
                 getter = getattr(manager, getter_name)
-                setattr(entry, attr, _string_property(getter, device_id))
-            except Exception as exc:              # noqa: BLE001
-                log.debug("WPD %s 取不到：%s", getter_name, exc)
+            except AttributeError as exc:         # noqa: BLE001
+                entry.name_error = entry.name_error or "{}：{}".format(
+                    getter_name, exc)
+                continue
+            text, error = _string_property(getter, device_id)
+            setattr(entry, attr, text)
+            if error and not entry.name_error:
+                entry.name_error = "{}：{}".format(getter_name, error)
 
         _try_open(entry, api, types, comtypes, CreateObject)
         report.devices.append(entry)

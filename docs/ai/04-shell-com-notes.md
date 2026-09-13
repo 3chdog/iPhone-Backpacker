@@ -812,3 +812,86 @@ comtypes 在 **runtime** 產生 COM wrapper 到 `comtypes/gen`，
   探針掛掉只會讓診斷報告少一段，**不影響任何其他功能**。
 → 這是**接受風險**而非忽視風險。若打包後探針一直不能用，
   退路是改用 ctypes 手刻 vtable 呼叫（只有 5 個呼叫，工作量可控）。
+
+---
+
+# WPD 探針的實測結果（2026-09-14，rc.2 真機）
+
+## 探針可用，而且 `Open()` 的答案就是我們要的
+
+實測輸出（開發者自己的機器，Win10 1607）：
+
+```
+WPD 探針：看到 3 台裝置
+    \\?\swd#wpdbusenum#_??_usbstor#disk&ven_&prod_usb_disk_2.0&...   open=成功
+    \\?\usb#vid_05ac&pid_12a8#0000802000117ce43684002e#{6ac27878-...}  open=成功
+    \\?\swd#wpdbusenum#_??_usbstor#disk&ven_multiple&prod_card_reader&...  open=成功
+```
+
+## ★ `GetDevices()` 不是只回 MTP 裝置
+
+三台裡面只有一台是 iPhone，另外兩台是**隨身碟與讀卡機** ——
+Windows 的 WPD FileSystem Volume Driver 會把卸除式磁碟區也註冊成 WPD 裝置。
+所以「WPD 看到 N 台」這個數字**不能**直接當成「有 N 台手機」。
+
+## ★★ WPD 的裝置 ID 會原封不動出現在 Shell 的解析名稱裡
+
+```
+Shell : ::{20D04FE0-3AEA-1069-A2D8-08002B30309D}\<以下這一段>
+WPD   : \\?\usb#vid_05ac&pid_12a8#0000802000117ce43684002e#{6ac27878-a6fa-4155-ba85-f98f491d4f33}
+```
+
+**所以直接做字串包含檢查就能回答「這兩條獨立的路看到的是不是同一台」。**
+不需要比對任何顯示名稱、也不需要寫死 vid/pid（守住 D5）。
+診斷報告第六段就是這樣交叉比對的。
+
+## `GetDeviceFriendlyName` 取不到名稱
+
+實測三台的名稱、製造商、描述**全是空的**。目前還不知道確切原因
+（推測是 comtypes 產生的簽章要 `WCHAR*`，而 `create_unicode_buffer()`
+的 `c_wchar` 陣列被型別檢查擋掉）。
+
+**但這不重要** —— 裝置 ID 裡面就有 vid/pid 與序號，比名稱可靠得多。
+現在報告一定會印出裝置 ID，並且把「名稱取不到的原因」一起印出來，
+下一輪就能確定是哪一種。
+
+**教訓**：`_string_property` 原本把失敗吞進 `log.debug`，
+於是報告只印「（取不到）」卻不說為什麼 —— 等於白跑一輪。
+**取不到的原因本身就是要回報的資訊。**
+
+---
+
+# comtypes 在凍結環境下會自己找到可寫的路（2026-09-14 實測）
+
+```
+Could not import comtypes.gen, trying to create it.
+Creating comtypes.gen package failed: [WinError 3] ..._internal\comtypes\gen
+Created a memory-only package.
+Using writeable comtypes cache directory: ...\Temp\comtypes_cache\iPhoneBackpacker-312
+# Generating comtypes.gen.PortableDeviceApiLib
+# Generating comtypes.gen.PortableDeviceTypesLib
+```
+
+`_internal\comtypes\gen` 不可寫時，comtypes 會自動退到
+`%TEMP%\comtypes_cache\<exe 名>-<python 版本>`，然後**成功**產生 wrapper。
+所以打包時**不需要**預先產生型別庫，只要把子模組收齊就好。
+
+## `collect_submodules("comtypes")` 要過濾掉 `comtypes.test`
+
+整包收會連 comtypes 自己的測試套件（約 60 個模組）一起拉進來，
+而 `comtypes.test.setup` 會再把 distutils / setuptools / pkg_resources
+整串帶進來。實測體積 **114 MB → 117 MB**、分析時間也明顯變長。
+測試套件對使用者零用處，多帶的東西只會增加防毒誤判的面積。
+
+---
+
+# `IFileOperationProgressSink` 已在真機驗證（2026-09-14）
+
+```
+逐檔回報已接上（IFileOperationProgressSink）
+收到 47 次逐檔回報：成功 47、失敗 0
+    0x00000000（S_OK 成功） × 47
+    FinishOperations：0x00000000（S_OK 成功）
+```
+
+第二輪 105 個檔案、4 個資料夾也一樣正常。**D19 成立，D6 正式作廢。**
