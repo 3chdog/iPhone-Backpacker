@@ -21,8 +21,8 @@ from pathlib import Path
 
 from win32com.shell import shell, shellcon
 
-from . import device, listing, shell_ns
-from .filters import MEDIA, categorize
+from . import copysink, device, listing, shell_ns, wpd_probe
+from .filters import MEDIA, categorize, extension_of
 from .logging_setup import default_log_dir
 
 log = logging.getLogger(__name__)
@@ -96,10 +96,13 @@ def _describe_this_pc(report):
     report.say()
 
     this_pc = shell_ns.this_pc_pidl()
+    enum_report = shell_ns.EnumReport()
+    rows = []
     for _child_abs, name, attrs, parsing in shell_ns.iter_entries(
         this_pc, flags=shell_ns.EVERYTHING,
-        want_attributes=True, want_parsing=True,
+        want_attributes=True, want_parsing=True, report=enum_report,
     ):
+        rows.append(name)
         confidence, reason = device._classify(parsing, attrs)
         marks = {
             device.Confidence.CONFIRMED: "★ 確定是可攜式裝置",
@@ -111,6 +114,12 @@ def _describe_this_pc(report):
         report.say("      parsing = {}".format(
             "None（讀不到）" if parsing is None else (parsing or "（空字串）")))
         report.say("      判定    = {}（{}）".format(marks[confidence], reason))
+
+    # ★ 這一層的列舉品質要記下來。民眾B 15:55 那次 Apple iPhone 從候選裡
+    #   整個消失，其中一個假設就是這裡被靜默截斷了 —— 沒有這行永遠證不了。
+    report.say()
+    report.say("這一層的列舉：{}".format(enum_report.describe()))
+    report.say("共 {} 個節點：{}".format(len(rows), "、".join(rows)))
 
 
 def _describe_api(report):
@@ -183,6 +192,35 @@ def _find_richest_level(dev):
     return best
 
 
+def _best_device(detection, candidates=()):
+    """挑一台最值得檢查的裝置：優先用實際採用的那台，其次第一個 CONFIRMED。"""
+    if detection is not None and detection.device is not None:
+        return detection.device
+    pool = list(candidates) or list(
+        detection.candidates if detection is not None else ())
+    for candidate in pool:
+        if candidate.confidence is device.Confidence.CONFIRMED:
+            return candidate
+    return pool[0] if pool else None
+
+
+def _pick_focus(detection, candidates=()):
+    """沒有指定檢查目標時，自己挑一個**在裝置上**的資料夾。
+
+    ★ 取最後一個 —— 資料夾照名稱排序（`202608__` 這種），最後面就是最近的照片。
+      使用者會抱怨的幾乎都是最新那幾個資料夾。
+    """
+    target = _best_device(detection, candidates)
+    if target is None:
+        return None
+    try:
+        _pidl, _label, folders = _find_richest_level(target)
+    except Exception as exc:   # noqa: BLE001
+        log.debug("挑選檢查目標失敗：%s", exc)
+        return None
+    return folders[-1] if folders else None
+
+
 def _describe_all_candidates(report, candidates):
     for candidate in candidates:
         report.say()
@@ -226,32 +264,51 @@ def _describe_folders(report, entries, label):
         report.say("!!   - 檔案總管有、這裡沒有 → 是程式漏了，請務必回報")
 
 
+def _is_local_path_folder(folder):
+    """這個節點是不是對應到真實檔案系統路徑。
+
+    ★ 用來擋掉 `3D Objects` 那種誤報（2026-09-13）：
+      Windows 10 從 21H2 起把 `3D Objects` 從檔案總管隱藏，命名空間項目還在、
+      實體資料夾卻常常不存在，於是三種旗標都會秒回 ERROR_PATH_NOT_FOUND。
+      舊版據此印出「顯示 0 個檔案很可能是讀取問題」，等於拿一個**必然失敗**
+      的目標當健康度指標，還把使用者嚇一跳。
+    """
+    try:
+        parsing = shell_ns.parsing_name(folder.abs_pidl)
+    except Exception:   # noqa: BLE001
+        return False
+    return shell_ns.looks_like_filesystem_path(parsing or "")
+
+
 def _describe_one_folder(report, folder):
     """某個資料夾到底有沒有東西。用三種旗標交叉比對。"""
     report.say("這一段用來回答：某個資料夾顯示 0 個檔案，是真的空的還是沒讀到。")
+    local = _is_local_path_folder(folder)
+    if local:
+        report.say("（注意：這是**本機**資料夾，不是手機裡的 —— "
+                   "它的結果不能拿來判斷裝置狀態。）")
     report.say()
 
     def count(flags, label):
-        """列舉並**記錄耗時**。
+        """列舉並印出完整的可信度紀錄。
 
         ★ 「8.8 秒回傳 0 項」和「20 毫秒回傳 0 項」是完全不同的兩件事 ——
           前者是逾時（裝置連線壞掉），後者才是真的空資料夾。
           民眾B 的 log 裡 13 個資料夾都剛好花 8.8 秒回傳 0 項，
           但報告只寫「0 項」，看不出這個關鍵差異。
         """
-        started = time.perf_counter()
+        enum_report = shell_ns.EnumReport()
         try:
-            items = list(shell_ns.iter_entries(folder.abs_pidl, flags=flags))
+            items = list(shell_ns.iter_entries(folder.abs_pidl, flags=flags,
+                                               verify_empty=True,
+                                               report=enum_report))
         except Exception as exc:   # noqa: BLE001
-            elapsed = (time.perf_counter() - started) * 1000
-            report.say("  {:<12} 讀取失敗（{:.0f} ms）：{}".format(
-                label, elapsed, exc))
+            report.say("  {:<12} 讀取失敗：{}".format(label, exc))
+            report.say("      {}".format(enum_report.describe()))
             return None
-        elapsed = (time.perf_counter() - started) * 1000
-        report.say("  {:<12} {} 項（{:.0f} ms）".format(label, len(items), elapsed))
-        if not items and elapsed > 1000:
-            report.say("      !! 花了 {:.1f} 秒才回傳 0 項 —— "
-                       "這比較像逾時，不像真的空資料夾。".format(elapsed / 1000))
+        report.say("  {:<12} {}".format(label, enum_report.describe()))
+        if not items and enum_report.suspicious_zero:
+            report.say("      !! 這個 0 不可信 —— 見上面的耗時與嘗試次數。")
         return len(items)
 
     counts = {}
@@ -262,6 +319,16 @@ def _describe_one_folder(report, folder):
 
     report.say()
     if None in counts.values():
+        if local:
+            # ★ 本機資料夾讀不到，多半是那個資料夾根本不存在（例如被
+            #   Windows 隱藏起來的 3D Objects），跟 iPhone 一點關係都沒有。
+            report.say("這是本機資料夾而且讀不到 —— "
+                       "多半是這個資料夾在你的電腦上根本不存在"
+                       "（Windows 會保留一些看不到的項目）。")
+            report.say("**這跟 iPhone 無關，不是問題。**")
+            report.say("若要檢查手機裡的資料夾，請在左邊清單裡勾選它，"
+                       "再按一次「產生診斷報告」。")
+            return
         report.say("!! 有列舉失敗 —— 顯示 0 個檔案很可能是讀取問題，不是真的空的。")
         return
 
@@ -290,6 +357,141 @@ def _describe_one_folder(report, folder):
     if names and not media:
         report.say("!! 有檔案但沒有一個算照片或影片 —— "
                    "副檔名可能是程式沒涵蓋的，請回報上面的清單。")
+
+
+#: 判斷傳輸模式時最多取樣幾個資料夾 / 幾個檔案。
+#: 這一段是診斷用的，不能把它變成「掃描整支手機」（D11 的教訓）。
+_MODE_SAMPLE_FOLDERS = 6
+_MODE_SAMPLE_FILES = 400
+
+
+def _sample_device_files(detection):
+    """從裝置上抓一小撮檔名，用來推斷傳輸模式。
+
+    ★ 從**最後面**開始取 —— 資料夾是照名稱排序的（`202608__` 這種），
+      最後面就是最近的照片，最能反映使用者現在的設定。
+    """
+    target = _best_device(detection)
+    if target is None:
+        return [], ""
+
+    _pidl, label, folders = _find_richest_level(target)
+    if not folders:
+        return [], label
+
+    names = []
+    for entry in reversed(folders[-_MODE_SAMPLE_FOLDERS:]):
+        try:
+            for _abs, name, _attrs in shell_ns.iter_entries(
+                entry.abs_pidl, flags=shell_ns.FILES_ONLY
+            ):
+                names.append(name)
+                if len(names) >= _MODE_SAMPLE_FILES:
+                    return names, label
+        except Exception as exc:   # noqa: BLE001
+            log.debug("取樣資料夾「%s」失敗：%s", entry.name, exc)
+    return names, label
+
+
+def _describe_transfer_mode(report, detection):
+    """判斷 iPhone 的「傳送到 Mac 或 PC」是「自動」還是「保留原始檔」。
+
+    ★★ 為什麼要放進報告（2026-09-13）：兩種模式的失敗成因完全不同，
+      而使用者幾乎不會主動講自己設了哪一種。之前為了問這一題，
+      要多來回一輪 issue。
+
+    ★ 判斷依據與它的極限，都要老實寫進報告：
+      「自動」模式**只有在 iOS 認為這台 PC 讀不懂 HEIC 時**才會即時轉檔。
+      若電腦上裝了 HEIC 解碼器（例如 CopyTrans HEIC 或微軟的 HEIF 擴充功能），
+      iOS 可能判定「這台讀得懂」而直接給 HEIC —— 也就是**看到 .heic
+      並不能 100% 斷定是「保留原始檔」**。所以這裡輸出的是證據 + 傾向，
+      不是斬釘截鐵的結論。
+    """
+    names, label = _sample_device_files(detection)
+    if not names:
+        report.say("取不到任何檔名樣本，無法判斷傳輸模式。")
+        report.say("（可能是裝置讀不到，或取樣到的資料夾剛好都沒有檔案。）")
+        return
+
+    report.say("取樣位置：[{}] 最後 {} 個資料夾，共 {} 個檔名".format(
+        label, _MODE_SAMPLE_FOLDERS, len(names)))
+    report.say()
+
+    exts = Counter(extension_of(n) or "（沒有副檔名）" for n in names)
+    report.say("副檔名分布：")
+    for ext, count in exts.most_common():
+        report.say("    .{:<10} {} 個".format(ext, count))
+
+    heic = sum(exts.get(e, 0) for e in ("heic", "heif"))
+    jpeg = sum(exts.get(e, 0) for e in ("jpg", "jpeg"))
+
+    # 同一張照片同時有 HEIC 與 JPEG 版本？
+    stems = {}
+    for name in names:
+        stem, _, ext = name.rpartition(".")
+        stems.setdefault(stem.lower(), set()).add(ext.lower())
+    both = [s for s, e in stems.items()
+            if e & {"heic", "heif"} and e & {"jpg", "jpeg"}]
+    edited = [n for n in names if n.upper().startswith("IMG_E")]
+
+    report.say()
+    report.say("HEIC/HEIF：{} 個　JPG/JPEG：{} 個".format(heic, jpeg))
+    report.say("同一張同時有 HEIC 與 JPEG 版本：{} 組".format(len(both)))
+    report.say("編輯後版本（IMG_E****）：{} 個".format(len(edited)))
+    report.say()
+
+    if heic:
+        report.say(">> 傾向：**保留原始檔**（清單裡直接看得到 .heic/.heif）")
+        report.say("   但這不是 100% —— 如果這台電腦裝了 HEIC 解碼器，")
+        report.say("   iOS 可能認為它讀得懂，即使設定是「自動」也直接給原始檔。")
+    elif jpeg:
+        report.say(">> 傾向：**自動**（完全沒有 .heic/.heif，照片都是 JPG）")
+        report.say("   也可能是使用者在「設定 → 相機 → 格式」選了「最相容」，")
+        report.say("   那樣拍出來本來就是 JPG。兩者從檔名分不出來。")
+    else:
+        report.say(">> 無法判斷：樣本裡既沒有 HEIC 也沒有 JPEG。")
+
+
+def _describe_wpd(report):
+    """WPD 探針 —— Shell 路徑分不出來的裝置狀態，這裡問得到（決策 D21）。
+
+    ★ 這一段失敗完全不影響程式，它只是報告的一段。
+    """
+    result = wpd_probe.probe()
+
+    if not result.available:
+        report.say("（這台電腦上的 WPD 探針不可用：{}）".format(
+            result.unavailable_reason))
+        report.say("這不影響備份功能，只是少一份判斷裝置狀態的資訊。")
+        return
+
+    if result.error:
+        report.say("!! 探針中途失敗：{}".format(result.error))
+
+    if not result.devices:
+        report.say("WPD 說：**一台可攜式裝置都沒有。**")
+        report.say("這是獨立於上面那些 Shell 判斷的第二個答案 ——")
+        report.say("如果上面看得到 iPhone 而這裡看不到，請務必回報。")
+        return
+
+    report.say("WPD 看到 {} 台裝置："
+               "（這是獨立於 Shell 列舉的第二個答案）".format(len(result.devices)))
+    for entry in result.devices:
+        report.say()
+        report.say("  {}".format(entry.friendly_name or "（沒有名稱）"))
+        report.say("      製造商    = {}".format(entry.manufacturer or "（取不到）"))
+        report.say("      描述      = {}".format(entry.description or "（取不到）"))
+        if entry.opened:
+            report.say("      連線測試  = ★ 可以開啟 —— **裝置本身是好的**")
+        else:
+            report.say("      連線測試  = !! 開不起來：{}".format(
+                copysink.describe_hresult(entry.open_hresult)))
+            if entry.open_error:
+                report.say("                  {}".format(entry.open_error))
+            report.say("      ↑ 這一行是 Shell 路徑給不出來的資訊。"
+                       "「被其他程式佔用」「裝置當掉」「已拔除」")
+            report.say("        在 Shell 那邊全都長成同一個 "
+                       "0x8007001E，只有這裡分得出來。")
 
 
 def _describe_log_tail(report):
@@ -327,7 +529,20 @@ def collect_report(focus_folder=None, progress=None):
     report.section("二、裝置偵測",
                    lambda: holder.update(detection=_describe_device(report)))
     detection = holder.get("detection")
+
+    # ★ 第二段失敗時（例如 probe 拿到 0x8007001E），舊版 detection 會是 None，
+    #   於是 candidates 變成空的，**第三段整段消失** —— 偏偏那是最有價值的一段，
+    #   而且它消失的時機正好是出事的時候。改成自己再找一次候選清單。
     candidates = detection.candidates if detection is not None else ()
+    if not candidates:
+        try:
+            candidates = tuple(device.find_portable_devices())
+            if candidates:
+                report.say()
+                report.say("（上一段失敗，改用備援方式重新列出候選裝置：{} 個）"
+                           .format(len(candidates)))
+        except Exception as exc:   # noqa: BLE001
+            log.debug("備援列出候選裝置也失敗：%s", exc)
 
     if candidates:
         # ★ 對**每一個**候選都走一次，不是只走選中的那個。
@@ -337,15 +552,26 @@ def collect_report(focus_folder=None, progress=None):
         report.section(
             "三、每個候選裝置底下的資料夾",
             lambda: _describe_all_candidates(report, candidates))
-    if focus_folder is not None:
-        report.section("四、[{}] 逐項檢查".format(focus_folder.name),
-                       lambda: _describe_one_folder(report, focus_folder))
+
+    # ★★ 逐項檢查的目標絕不能預設成「本機」底下的第一個節點。
+    #   排序後 "3d objects" 的 '3' 在 ASCII 排在所有字母前面，於是它
+    #   一直是樹狀清單的第一個、也就是預設選取的那個。而 Windows 10 21H2
+    #   之後 3D Objects 的實體資料夾常常不存在，三種旗標必定失敗，
+    #   報告就印出「顯示 0 個檔案很可能是讀取問題」嚇使用者 ——
+    #   拿一個必然失敗的目標當健康度指標。
+    focus = focus_folder or _pick_focus(detection, candidates)
+    if focus is not None:
+        report.section("四、[{}] 逐項檢查".format(focus.name),
+                       lambda: _describe_one_folder(report, focus))
     else:
         report.title("四、逐項檢查")
-        report.say("（沒有指定資料夾。若某個資料夾的檔案數看起來不對，")
-        report.say("　請在程式裡點選那個資料夾，再按一次「產生診斷報告」。）")
+        report.say("（找不到可以檢查的資料夾。若某個資料夾的檔案數看起來不對，")
+        report.say("　請在程式裡勾選那個資料夾，再按一次「產生診斷報告」。）")
 
-    report.section("五、紀錄檔內容", lambda: _describe_log_tail(report))
+    report.section("五、傳輸模式判定",
+                   lambda: _describe_transfer_mode(report, detection))
+    report.section("六、WPD 探針（裝置狀態）", lambda: _describe_wpd(report))
+    report.section("七、紀錄檔內容", lambda: _describe_log_tail(report))
 
     report.title("報告結束")
     report.say("耗時 {:.1f} 秒。".format(time.perf_counter() - started))
